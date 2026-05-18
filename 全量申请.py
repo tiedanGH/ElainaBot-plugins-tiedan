@@ -61,13 +61,26 @@ async def apply_full_access(event, match):
         return await event.reply(f"<@{event.user_id}> 当前群已开启全量消息，无需再次申请")
     group_code = match.group(1)
     if not group_code:
-        return await event.reply(f"<@{event.user_id}> 请输入群号，格式为「全量申请 <本群群号>」")
+        md = (
+            f"请输入本群群号\n"
+            "```指令详情\n"
+            "正确格式：全量申请 <本群群号>\n"
+            "```"
+        )
+        btn = [[{'text': '重新申请', 'data': '全量申请', 'style': 4}]]
+        return await event.reply(md, btn)
     cfg = _load_config()
     if not cfg or not cfg.get('botUin') or not cfg.get('botUid'):
         return await event.reply(f"<@{event.user_id}> 请先配置 全量申请_config.json（需填写 botUin 和 botUid）")
     url = _URL_TPL.format(group_code=group_code, bot_uin=cfg['botUin'], bot_uid=cfg['botUid'])
-    msg = f"请群主点击下方按钮授权\n**需要更新QQ到最新版(9.2.90及以上)**\n{_IMG}"
-    btn = [[{'text': '群主大大请点击这里同意申请', 'link': url, 'style': 1}]]
+    msg = (
+        "## 🔔 全量消息授权\n"
+        "群主授权后，机器人可以推送主动消息，*无需再点击刷新按钮*\n"
+        f"{_IMG}\n"
+        "**请群主点击下方按钮授权**\n"
+        "> **需要更新QQ到最新版(9.2.90及以上)**"
+    )
+    btn = [[{'text': '群主大大请点击这里同意申请', 'link': url, 'style': 1, 'admin': True}]]
     await event.reply(msg, btn)
 
 
@@ -79,10 +92,14 @@ async def list_full_access(event, match):
     groups = _bot_manager_ref.get_full_access_groups()
     if not groups:
         return await event.reply(f"<@{event.user_id}> 暂无全量群记录")
-    lines = [f"<@{event.user_id}> 全量群列表（共 {len(groups)} 个）：\n"]
-    for r in groups:
-        lines.append(f"> {r['group_id']}")
-    await event.reply("\n".join(lines))
+    gids = "\n".join(r['group_id'] for r in groups)
+    md = (
+        f"全量群列表（共 {len(groups)} 个）：\n"
+        "```群列表\n"
+        f"{gids}\n"
+        "```"
+    )
+    await event.reply(md)
 
 
 @handler(r'^设置机器人QQ\s*(\d{5,15})$', name='设置机器人QQ', desc='设置全量申请的 botUin', owner_only=True)
