@@ -1,0 +1,253 @@
+"""计时器: 倒计时 + 多时区世界时间 (主人可修改铁蛋时区, 配置持久化到 data/计时器_config.yaml)"""
+
+import asyncio
+from datetime import datetime
+
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+except ImportError:
+    ZoneInfo = None
+    ZoneInfoNotFoundError = Exception
+
+from core.plugin.decorators import handler
+from core.base.config import cfg
+import core.plugin.context as _ctx_mod
+
+
+# ==================== 配置 (插件加载时初始化) ====================
+
+_DEFAULTS = {
+    'tiedan_tz': 'Asia/Shanghai',
+    'tiedan_tz_name': '北京',
+}
+
+# 模块 exec 时, _loader.py 已经把当前插件 ctx 注入到 ctx_mod.ctx。
+# 捕获到本地变量, 避免在 on_load 执行(ctx 已被 reset 为 None)时无法访问。
+_ctx = _ctx_mod.ctx
+_config = _ctx.ensure_config(_DEFAULTS, '计时器_config.yaml')
+
+
+def _save_config():
+    _ctx.save_config(_config, '计时器_config.yaml')
+
+
+def _is_full_volume_group(event):
+    """判断是否位于全量群 (与 core/plugin/_dispatch.py:95-100 同源逻辑)"""
+    appid = event.appid or ''
+    if cfg.get_bot_setting(appid, 'non_at_message.enabled', False):
+        return True
+    gid = event.group_id or ''
+    wl = cfg.get_bot_setting(appid, 'non_at_message.group_whitelist', []) or []
+    return bool(gid and gid in wl)
+
+
+# 固定时区 (参照 Kotlin 原版, 三个别名都映射到太平洋)
+_FIXED = {
+    'star': ('America/Los_Angeles', '太平洋标准时间', '星星'),
+    '星星': ('America/Los_Angeles', '太平洋标准时间', '星星'),
+    'bc':   ('America/Los_Angeles', '太平洋标准时间', 'BC'),
+    'BC':   ('America/Los_Angeles', '太平洋标准时间', 'BC'),
+    'cat':  ('America/Los_Angeles', '太平洋标准时间', '猫猫'),
+    '猫猫': ('America/Los_Angeles', '太平洋标准时间', '猫猫'),
+}
+
+
+# ==================== 倒计时 ====================
+
+_MAX_THREADS = 5
+_active_threads = 0
+_NOTIFY = {
+    1800: '还剩30分钟',
+    600:  '还剩10分钟',
+    180:  '还剩3分钟',
+    120:  '还剩2分钟',
+    60:   '还剩1分钟',
+    30:   '还剩30秒',
+    10:   '还剩10秒',
+}
+
+
+async def _run_countdown(event, total):
+    """后台倒计时: 每秒检查关键节点并播报"""
+    global _active_threads
+    try:
+        remaining = total
+        while remaining >= 0:
+            if remaining == 0:
+                try:
+                    await event.reply("时间到!")
+                except Exception:
+                    pass
+                break
+            tip = _NOTIFY.get(remaining)
+            if tip and remaining != total:
+                try:
+                    await event.reply(f"倒计时{tip}")
+                except Exception:
+                    pass
+            await asyncio.sleep(1)
+            remaining -= 1
+    finally:
+        _active_threads -= 1
+
+
+# ==================== 帮助文本 ====================
+
+_HELP_EN = (
+    " ·⏱️ 计时器指令帮助\n"
+    "▶️ 启动一个计时器\n"
+    "/t count <秒>\n"
+    " ·👥 查看群友当前时间\n"
+    "/t tiedan\n"
+    "/t star\n"
+    "/t BC\n"
+    "/t 猫猫"
+)
+_HELP_CN = (
+    " ·⏱️ 计时器指令帮助\n"
+    "▶️ 启动一个计时器\n"
+    "/时间 倒计时 <秒>\n"
+    " ·👥 查看群友当前时间\n"
+    "/时间 铁蛋\n"
+    "/时间 星星\n"
+    "/时间 BC\n"
+    "/时间 猫猫"
+)
+
+
+# ==================== 时间格式化 ====================
+
+def _format_at(tz_id):
+    """返回 (HH:MM:SS   ±HHMM, error_msg). error_msg 非空表示时区无效。"""
+    if ZoneInfo is None:
+        return None, "Python 版本过低，缺少 zoneinfo 模块"
+    try:
+        dt = datetime.now(ZoneInfo(tz_id))
+    except ZoneInfoNotFoundError:
+        return None, f"未找到时区：{tz_id} (可能缺 tzdata 包)"
+    except Exception as e:
+        return None, f"时区解析失败：{e}"
+    return dt.strftime('%H:%M:%S   %z'), ''
+
+
+# ==================== 主入口 (普通指令) ====================
+
+@handler(
+    r'^/?(?:t|时间)(?:\s+(.+))?$',
+    name='计时器',
+    desc='倒计时 + 多时区世界时间 (子命令：help)',
+)
+async def time_main(event, match):
+    # 群场景: 仅全量群可触发 (静默拒绝其他群)
+    if event.is_group and not _is_full_volume_group(event):
+        return
+
+    args_raw = (match.group(1) or '').strip()
+    if not args_raw:
+        await event.reply(_HELP_EN)
+        return
+
+    parts = args_raw.split(maxsplit=2)
+    sub = parts[0]
+
+    # ----- 帮助 -----
+    if sub == 'help':
+        await event.reply(_HELP_EN); return
+    if sub == '帮助':
+        await event.reply(_HELP_CN); return
+
+    # ----- 倒计时 (禁止私信) -----
+    if sub in ('count', '倒计时'):
+        if event.is_direct:
+            await event.reply("[场景限制] 倒计时仅在全量群可用")
+            return
+        if len(parts) < 2:
+            await event.reply("[参数不足]\n用法：/t count <秒>")
+            return
+        try:
+            second = int(parts[1])
+        except ValueError:
+            await event.reply("数字转换错误，时间必须为整数")
+            return
+        if second < 1 or second > 3600:
+            await event.reply("倒计时仅支持 1 ~ 3600 秒")
+            return
+        global _active_threads
+        if _active_threads >= _MAX_THREADS:
+            await event.reply(f"计时器无法启动：已经有 {_active_threads} 个进程正在运行")
+            return
+        _active_threads += 1
+        await event.reply("倒计时开始")
+        asyncio.create_task(_run_countdown(event, second))
+        return
+
+    # ----- 铁蛋时间 (可配置) -----
+    if sub in ('tiedan', '铁蛋'):
+        tz_id = _config.get('tiedan_tz') or _DEFAULTS['tiedan_tz']
+        tz_name = _config.get('tiedan_tz_name') or ''
+        formatted, err = _format_at(tz_id)
+        if err:
+            await event.reply(f"❌ {err}\n请主人用 /t 时区 <IANA时区ID> 修复")
+            return
+        suffix = f"\n({tz_name}时间)" if tz_name else ""
+        await event.reply(f"铁蛋现在的时间为：\n{formatted}{suffix}")
+        return
+
+    # ----- 固定时区 (star/BC/猫猫) -----
+    fixed = _FIXED.get(sub)
+    if fixed:
+        tz_id, tz_name, display = fixed
+        formatted, err = _format_at(tz_id)
+        if err:
+            await event.reply(f"❌ {err}")
+            return
+        await event.reply(f"{display}现在的时间为：\n{formatted}\n({tz_name})")
+        return
+
+    # ----- 时区 (主人 handler 漏到这里 = 非主人 或 参数缺失) -----
+    if sub in ('时区', 'timezone'):
+        await event.reply("[权限不足]\n该指令仅主人可用")
+        return
+
+    # ----- 未知子命令 -----
+    await event.reply(f"[参数不匹配] 未知子命令： {sub}\n请使用 /t help 查看指令帮助")
+
+
+# ==================== 主人专用：设置铁蛋时区 ====================
+
+@handler(
+    r'^/?(?:t|时间)\s+(?:时区|timezone)\s+(\S+)(?:\s+(.+))?$',
+    name='设置铁蛋时区',
+    desc='主人指令：修改铁蛋的时区',
+    priority=10,
+    owner_only=True,
+)
+async def set_tiedan_tz(event, match):
+    if event.is_group and not _is_full_volume_group(event):
+        return
+
+    tz_id = match.group(1).strip()
+    tz_name = (match.group(2) or '').strip()
+
+    if ZoneInfo is None:
+        await event.reply("❌ Python 版本过低，缺少 zoneinfo 模块")
+        return
+    try:
+        ZoneInfo(tz_id)
+    except ZoneInfoNotFoundError:
+        await event.reply(
+            f"❌ 无效的时区 ID：{tz_id}\n"
+            f"请使用标准 IANA 时区, 例：Asia/Shanghai"
+        )
+        return
+    except Exception as e:
+        await event.reply(f"❌ 时区校验失败：{e}")
+        return
+
+    _config['tiedan_tz'] = tz_id
+    _config['tiedan_tz_name'] = tz_name
+    _save_config()
+    if tz_name:
+        await event.reply(f"时区显示已修改：{tz_id}({tz_name}时间)")
+    else:
+        await event.reply(f"时区显示已修改：{tz_id}")
