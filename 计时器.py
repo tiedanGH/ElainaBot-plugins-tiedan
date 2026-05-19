@@ -223,7 +223,7 @@ async def time_main(event, match):
         return
 
     # ----- 未知子命令 -----
-    await event.reply(f"[参数不匹配] 未知子命令： {sub}\n请使用 /t help 查看指令帮助")
+    await event.reply(f"[参数不匹配] 未知子命令\n请使用 /t help 查看指令帮助")
 
 
 # ==================== 主人专用：设置铁蛋时区 ====================
