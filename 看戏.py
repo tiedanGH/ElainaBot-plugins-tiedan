@@ -4,7 +4,6 @@ import random
 from datetime import datetime
 
 from core.plugin.decorators import handler
-from core.base.config import cfg
 
 
 KX_REPLIES = (
@@ -22,21 +21,36 @@ KX_REPLIES = (
 
 
 def _is_full_volume_group(event):
-    """判断是否位于全量群"""
-    appid = event.appid or ''
-    if cfg.get_bot_setting(appid, 'non_at_message.enabled', False):
-        return True
+    """判断是否位于全量群: 用主框架 data.db 中的 full_access_groups 记录 (与 /全量列表 同源)"""
+    if not event.is_group:
+        return False
     gid = event.group_id or ''
-    wl = cfg.get_bot_setting(appid, 'non_at_message.group_whitelist', []) or []
-    return bool(gid and gid in wl)
+    if not gid:
+        return False
+    try:
+        from core.bot.manager import _bot_manager_ref
+        if not _bot_manager_ref:
+            return False
+        rows = _bot_manager_ref.get_full_access_groups() or []
+        for r in rows:
+            rid = r.get('group_id') if isinstance(r, dict) else r
+            if rid == gid:
+                return True
+    except Exception:
+        pass
+    return False
 
 
 @handler(r'^看戏$', name='看戏',
          desc='随机回复一句催促入局的话',
          group_only=True)
 async def kanxi(event, match):
-    if not _is_full_volume_group(event):
-        return  # 静默拒绝非全量群
+    # 群场景: 仅全量群可触发
+    if event.is_group and not _is_full_volume_group(event):
+        btn = [[{'text': '全量消息授权', 'data': '全量申请', 'style': 4}]]
+        await event.reply("ℹ 此功能仅全量群可用", btn)
+        return
+
     reply = random.choice(KX_REPLIES).format(
         time=datetime.now().strftime('%H:%M:%S')
     )

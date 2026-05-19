@@ -10,7 +10,6 @@ except ImportError:
     ZoneInfoNotFoundError = Exception
 
 from core.plugin.decorators import handler
-from core.base.config import cfg
 import core.plugin.context as _ctx_mod
 
 
@@ -32,13 +31,24 @@ def _save_config():
 
 
 def _is_full_volume_group(event):
-    """判断是否位于全量群 (与 core/plugin/_dispatch.py:95-100 同源逻辑)"""
-    appid = event.appid or ''
-    if cfg.get_bot_setting(appid, 'non_at_message.enabled', False):
-        return True
+    """判断是否位于全量群: 用主框架 data.db 中的 full_access_groups 记录 (与 /全量列表 同源)"""
+    if not event.is_group:
+        return False
     gid = event.group_id or ''
-    wl = cfg.get_bot_setting(appid, 'non_at_message.group_whitelist', []) or []
-    return bool(gid and gid in wl)
+    if not gid:
+        return False
+    try:
+        from core.bot.manager import _bot_manager_ref
+        if not _bot_manager_ref:
+            return False
+        rows = _bot_manager_ref.get_full_access_groups() or []
+        for r in rows:
+            rid = r.get('group_id') if isinstance(r, dict) else r
+            if rid == gid:
+                return True
+    except Exception:
+        pass
+    return False
 
 
 # 固定时区 (参照 Kotlin 原版, 三个别名都映射到太平洋)
@@ -68,21 +78,22 @@ _NOTIFY = {
 
 
 async def _run_countdown(event, total):
-    """后台倒计时: 每秒检查关键节点并播报"""
+    """后台倒计时: 每秒检查关键节点并播报 (主动消息推送, 不受 msg_id 5min/5次 限额约束)"""
     global _active_threads
+    gid = event.group_id
     try:
         remaining = total
         while remaining >= 0:
             if remaining == 0:
                 try:
-                    await event.reply("时间到!")
+                    await event.send_to_group(gid, "时间到!")
                 except Exception:
                     pass
                 break
             tip = _NOTIFY.get(remaining)
             if tip and remaining != total:
                 try:
-                    await event.reply(f"倒计时{tip}")
+                    await event.send_to_group(gid, f"倒计时{tip}")
                 except Exception:
                     pass
             await asyncio.sleep(1)
@@ -138,8 +149,10 @@ def _format_at(tz_id):
     desc='倒计时 + 多时区世界时间 (子命令：help)',
 )
 async def time_main(event, match):
-    # 群场景: 仅全量群可触发 (静默拒绝其他群)
+    # 群场景: 仅全量群可触发
     if event.is_group and not _is_full_volume_group(event):
+        btn = [[{'text': '全量消息授权', 'data': '全量申请', 'style': 4}]]
+        await event.reply("ℹ 此功能仅全量群可用", btn)
         return
 
     args_raw = (match.group(1) or '').strip()
@@ -159,7 +172,7 @@ async def time_main(event, match):
     # ----- 倒计时 (禁止私信) -----
     if sub in ('count', '倒计时'):
         if event.is_direct:
-            await event.reply("[场景限制] 倒计时仅在全量群可用")
+            await event.reply("ℹ 倒计时仅在全量群可用")
             return
         if len(parts) < 2:
             await event.reply("[参数不足]\n用法：/t count <秒>")
@@ -177,7 +190,7 @@ async def time_main(event, match):
             await event.reply(f"计时器无法启动：已经有 {_active_threads} 个进程正在运行")
             return
         _active_threads += 1
-        await event.reply("倒计时开始")
+        await event.send_to_group(event.group_id, "倒计时开始")
         asyncio.create_task(_run_countdown(event, second))
         return
 
@@ -224,6 +237,8 @@ async def time_main(event, match):
 )
 async def set_tiedan_tz(event, match):
     if event.is_group and not _is_full_volume_group(event):
+        btn = [[{'text': '全量消息授权', 'data': '全量申请 ', 'style': 4}]]
+        await event.reply("此功能仅全量群可用", btn)
         return
 
     tz_id = match.group(1).strip()
