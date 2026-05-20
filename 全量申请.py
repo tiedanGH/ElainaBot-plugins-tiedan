@@ -62,9 +62,9 @@ async def apply_full_access(event, match):
     group_code = match.group(1)
     if not group_code:
         md = (
-            f"请输入本群群号\n"
-            "```指令详情\n"
-            "正确格式：全量申请 <本群群号>\n"
+            f"需要输入本群群号\n"
+            "```正确格式\n"
+            "全量申请 <本群群号>\n"
             "```"
         )
         btn = [[{'text': '重新申请', 'data': '全量申请', 'style': 4}]]
