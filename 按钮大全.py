@@ -138,5 +138,9 @@ async def six_buttons(event, match):
             {'text': '五子棋', 'data': '/新游戏 五子棋', 'type': 2, 'style': 0},
             {'text': '六贯棋', 'data': '/新游戏 六贯棋', 'type': 2, 'style': 0},
         ],
+        [
+            {'text': '🏠 欢迎菜单', 'type': 1, 'data': '菜单', 'style': 1},
+            {'text': '📖 指令帮助', 'data': '/帮助', 'style': 1},
+        ],
     ]
     await event.reply("# 按钮测试", buttons=buttons)
