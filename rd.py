@@ -464,7 +464,7 @@ def _cmd_rn(args):
 
 @handler(r'^/?rd(?:\s+(.+?))?\s*$',
          name='rd-随机抽取',
-         desc='随机/算式插件 (本地沙箱, 输出严格脱敏)')
+         desc='[仅全量] 随机/算式插件 (本地沙箱, 输出严格脱敏)')
 async def cmd_rd(event, match):
     # 群场景: 仅全量群可触发 (私信不限)
     if event.is_group and not _is_full_volume_group(event):

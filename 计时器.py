@@ -146,7 +146,7 @@ def _format_at(tz_id):
 @handler(
     r'^/?(?:t|时间)(?:\s+(.+))?$',
     name='计时器',
-    desc='倒计时 + 多时区世界时间 (子命令：help)',
+    desc='[部分全量] 倒计时 + 多时区世界时间 (子命令：help)',
 )
 async def time_main(event, match):
     # 群场景: 仅全量群可触发
@@ -231,7 +231,7 @@ async def time_main(event, match):
 @handler(
     r'^/?(?:t|时间)\s+(?:时区|timezone)\s+(\S+)(?:\s+(.+))?$',
     name='设置铁蛋时区',
-    desc='主人指令：修改铁蛋的时区',
+    desc='[仅全量] 主人指令：修改铁蛋的时区',
     priority=10,
     owner_only=True,
 )

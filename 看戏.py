@@ -42,7 +42,7 @@ def _is_full_volume_group(event):
 
 
 @handler(r'^看戏$', name='看戏',
-         desc='随机回复一句催促入局的话',
+         desc='[仅全量] 随机回复一句催促入局的话',
          group_only=True)
 async def kanxi(event, match):
     # 群场景: 仅全量群可触发
