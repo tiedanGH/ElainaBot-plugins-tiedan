@@ -1,4 +1,10 @@
-"""计时器: 倒计时 + 多时区世界时间 (主人可修改铁蛋时区, 配置持久化到 data/计时器_config.yaml)"""
+"""计时器: 倒计时 + 多时区世界时间 (主人可修改铁蛋时区, 配置持久化到 data/计时器_config.yaml)
+
+输出策略:
+  · 全部消息走纯文本 (msg_type=MSG_TYPE_TEXT), 不渲染 markdown
+  · 全部回复带 message_reference_id, 引用触发本指令的用户原消息
+  · 倒计时后台播报用 send_to_group 主动消息 (跨任务发送), 同样带引用
+"""
 
 import asyncio
 from datetime import datetime
@@ -10,6 +16,7 @@ except ImportError:
     ZoneInfoNotFoundError = Exception
 
 from core.plugin.decorators import handler
+from core.message._http import MSG_TYPE_TEXT
 import core.plugin.context as _ctx_mod
 
 
@@ -51,6 +58,37 @@ def _is_full_volume_group(event):
     return False
 
 
+# ==================== 统一发送辅助 ====================
+# 所有出口都走 (a) 纯文本 (b) 引用原指令消息 — 框架 _build_core_payload 会把
+# message_reference_id 自动包成 {'message_id': ..., 'ignore_get_message_error': True}
+#
+# !! 关键: V2 群聊的 message_reference.message_id 必须用 REFIDX 格式
+#         (从 message_scene.ext.msg_idx 解析, 已由 parsers.py 落到
+#          event.message_reference_id). 直接传 event.message_id (ROBOT1.0_xxx 格式)
+#         会被 QQ 服务端忽略, 客户端不会渲染引用预览框。
+
+def _ref_id(event):
+    """返回当前消息的 REFIDX (V2 群聊引用回复用的 ID), 不存在则返回空串"""
+    return getattr(event, 'message_reference_id', '') or ''
+
+
+def _send_kwargs(event):
+    """构造 msg_type=TEXT + 引用 REFIDX 的 kwargs"""
+    kwargs = {'msg_type': MSG_TYPE_TEXT}
+    ref = _ref_id(event)
+    if ref:
+        kwargs['message_reference_id'] = ref
+    return kwargs
+
+
+async def _reply(event, content, buttons=None):
+    """统一 reply: 文本 + 引用原指令"""
+    kwargs = _send_kwargs(event)
+    if buttons is not None:
+        kwargs['buttons'] = buttons
+    await event.reply(content, **kwargs)
+
+
 # 固定时区 (参照 Kotlin 原版, 三个别名都映射到太平洋)
 _FIXED = {
     'star': ('America/Los_Angeles', '太平洋标准时间', '星星'),
@@ -81,19 +119,21 @@ async def _run_countdown(event, total):
     """后台倒计时: 每秒检查关键节点并播报 (主动消息推送, 不受 msg_id 5min/5次 限额约束)"""
     global _active_threads
     gid = event.group_id
+    # 跨 task 提前算好 push kwargs (event 字段后续可能被框架重置)
+    push_kw = _send_kwargs(event)
     try:
         remaining = total
         while remaining >= 0:
             if remaining == 0:
                 try:
-                    await event.send_to_group(gid, "时间到!")
+                    await event.send_to_group(gid, "时间到!", **push_kw)
                 except Exception:
                     pass
                 break
             tip = _NOTIFY.get(remaining)
             if tip and remaining != total:
                 try:
-                    await event.send_to_group(gid, f"倒计时{tip}")
+                    await event.send_to_group(gid, f"倒计时{tip}", **push_kw)
                 except Exception:
                     pass
             await asyncio.sleep(1)
@@ -152,12 +192,12 @@ async def time_main(event, match):
     # 群场景: 仅全量群可触发
     if event.is_group and not _is_full_volume_group(event):
         btn = [[{'text': '全量消息授权', 'data': '全量申请', 'style': 4}]]
-        await event.reply("ℹ 此功能仅全量群可用", btn)
+        await _reply(event, "ℹ 此功能仅全量群可用", buttons=btn)
         return
 
     args_raw = (match.group(1) or '').strip()
     if not args_raw:
-        await event.reply(_HELP_EN)
+        await _reply(event, _HELP_EN)
         return
 
     parts = args_raw.split(maxsplit=2)
@@ -165,32 +205,33 @@ async def time_main(event, match):
 
     # ----- 帮助 -----
     if sub == 'help':
-        await event.reply(_HELP_EN); return
+        await _reply(event, _HELP_EN); return
     if sub == '帮助':
-        await event.reply(_HELP_CN); return
+        await _reply(event, _HELP_CN); return
 
     # ----- 倒计时 (禁止私信) -----
     if sub in ('count', '倒计时'):
         if event.is_direct:
-            await event.reply("ℹ 倒计时仅在全量群可用")
+            await _reply(event, "ℹ 倒计时仅在全量群可用")
             return
         if len(parts) < 2:
-            await event.reply("[参数不足]\n用法：/t count <秒>")
+            await _reply(event, "[参数不足]\n用法：/t count <秒>")
             return
         try:
             second = int(parts[1])
         except ValueError:
-            await event.reply("数字转换错误，时间必须为整数")
+            await _reply(event, "数字转换错误，时间必须为整数")
             return
         if second < 1 or second > 3600:
-            await event.reply("倒计时仅支持 1 ~ 3600 秒")
+            await _reply(event, "倒计时仅支持 1 ~ 3600 秒")
             return
         global _active_threads
         if _active_threads >= _MAX_THREADS:
-            await event.reply(f"计时器无法启动：已经有 {_active_threads} 个进程正在运行")
+            await _reply(event, f"计时器无法启动：已经有 {_active_threads} 个进程正在运行")
             return
         _active_threads += 1
-        await event.send_to_group(event.group_id, "倒计时开始")
+        # "倒计时开始" 也走主动消息 + 引用, 与后台 _run_countdown 输出风格一致
+        await event.send_to_group(event.group_id, "倒计时开始", **_send_kwargs(event))
         asyncio.create_task(_run_countdown(event, second))
         return
 
@@ -200,10 +241,10 @@ async def time_main(event, match):
         tz_name = _config.get('tiedan_tz_name') or ''
         formatted, err = _format_at(tz_id)
         if err:
-            await event.reply(f"❌ {err}\n请主人用 /t 时区 <IANA时区ID> 修复")
+            await _reply(event, f"❌ {err}\n请主人用 /t 时区 <IANA时区ID> 修复")
             return
         suffix = f"\n({tz_name}时间)" if tz_name else ""
-        await event.reply(f"铁蛋现在的时间为：\n{formatted}{suffix}")
+        await _reply(event, f"铁蛋现在的时间为：\n{formatted}{suffix}")
         return
 
     # ----- 固定时区 (star/BC/猫猫) -----
@@ -212,18 +253,18 @@ async def time_main(event, match):
         tz_id, tz_name, display = fixed
         formatted, err = _format_at(tz_id)
         if err:
-            await event.reply(f"❌ {err}")
+            await _reply(event, f"❌ {err}")
             return
-        await event.reply(f"{display}现在的时间为：\n{formatted}\n({tz_name})")
+        await _reply(event, f"{display}现在的时间为：\n{formatted}\n({tz_name})")
         return
 
     # ----- 时区 (主人 handler 漏到这里 = 非主人 或 参数缺失) -----
     if sub in ('时区', 'timezone'):
-        await event.reply("[权限不足]\n该指令仅主人可用")
+        await _reply(event, "[权限不足]\n该指令仅主人可用")
         return
 
     # ----- 未知子命令 -----
-    await event.reply(f"[参数不匹配] 未知子命令\n请使用 /t help 查看指令帮助")
+    await _reply(event, "[参数不匹配] 未知子命令\n请使用 /t help 查看指令帮助")
 
 
 # ==================== 主人专用：设置铁蛋时区 ====================
@@ -238,31 +279,31 @@ async def time_main(event, match):
 async def set_tiedan_tz(event, match):
     if event.is_group and not _is_full_volume_group(event):
         btn = [[{'text': '全量消息授权', 'data': '全量申请 ', 'style': 4}]]
-        await event.reply("此功能仅全量群可用", btn)
+        await _reply(event, "此功能仅全量群可用", buttons=btn)
         return
 
     tz_id = match.group(1).strip()
     tz_name = (match.group(2) or '').strip()
 
     if ZoneInfo is None:
-        await event.reply("❌ Python 版本过低，缺少 zoneinfo 模块")
+        await _reply(event, "❌ Python 版本过低，缺少 zoneinfo 模块")
         return
     try:
         ZoneInfo(tz_id)
     except ZoneInfoNotFoundError:
-        await event.reply(
+        await _reply(event,
             f"❌ 无效的时区 ID：{tz_id}\n"
             f"请使用标准 IANA 时区, 例：Asia/Shanghai"
         )
         return
     except Exception as e:
-        await event.reply(f"❌ 时区校验失败：{e}")
+        await _reply(event, f"❌ 时区校验失败：{e}")
         return
 
     _config['tiedan_tz'] = tz_id
     _config['tiedan_tz_name'] = tz_name
     _save_config()
     if tz_name:
-        await event.reply(f"时区显示已修改：{tz_id}({tz_name}时间)")
+        await _reply(event, f"时区显示已修改：{tz_id}({tz_name}时间)")
     else:
-        await event.reply(f"时区显示已修改：{tz_id}")
+        await _reply(event, f"时区显示已修改：{tz_id}")
