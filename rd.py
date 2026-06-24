@@ -19,6 +19,9 @@ import threading
 from collections import Counter
 
 from core.plugin.decorators import handler
+from core.base.logger import get_logger, PLUGIN
+
+log = get_logger(PLUGIN, "rd")
 
 
 # ==================== 沙箱 (一次性导入) ====================
@@ -33,6 +36,7 @@ except ImportError:
     safe_builtins = {}
     default_guarded_getiter = None
     safer_getattr = None
+    log.warning("RestrictedPython 未安装，智能算式功能将不可用（其他子命令正常）。安装组件: pip install RestrictedPython")
 
 
 def _safe_getitem(obj, index):
@@ -169,7 +173,7 @@ def _dice_compute(expression):
     若调用方主线程 join 超时, 会通过 ctypes 注入 TimeoutError 中断本函数。
     """
     if not _SANDBOX_AVAILABLE:
-        return None, None, "[执行失败] 运行环境错误：沙箱组件未安装"
+        return None, None, "[执行失败] 运行环境错误：RestrictedPython 沙箱组件未安装"
     if not expression or len(expression) < 3:
         return None, None, "[错误] 算式过短 (至少 3 字符)"
     if not _ASCII_ONLY.match(expression):
