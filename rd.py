@@ -190,8 +190,8 @@ def _dice_compute(expression):
                     parts = re.split(r'd|D', seg)
                     x = 1 if parts[0] == '' else int(parts[0])
                     y = int(parts[1])
-                    if not (1 <= x <= 10000 and 1 <= y <= 10000):
-                        return None, None, "[错误] 骰子参数越界 (x, y 1~10000)"
+                    if not (1 <= x <= 1000000 and 1 <= y <= 1000000):
+                        return None, None, "[错误] 骰子参数越界 (x, y 1~1000000)"
                     if len(parts) > 2:
                         return None, None, "[错误] 骰子格式错误 (d 不能连用)"
                     rolls = [random.randint(1, y) for _ in range(x)]
@@ -462,7 +462,7 @@ def _cmd_rn(args):
 
 # ==================== 主入口 ====================
 
-@handler(r'^/?rd(?:\s+(.+?))?\s*$',
+@handler(r'^[/#]rd(?:\s+(.+?))?\s*$',
          name='rd-随机抽取',
          desc='[仅全量] 随机/算式插件 (本地沙箱, 输出严格脱敏)')
 async def cmd_rd(event, match):
