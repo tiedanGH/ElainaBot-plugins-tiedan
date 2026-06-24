@@ -279,29 +279,6 @@ async def _run_dice(expression):
         return None, None, "[执行失败] 发生未知错误"
 
 
-# ==================== 全量群判定 (与 comb.py / 计时器.py 同源) ====================
-
-def _is_full_volume_group(event):
-    """判断是否位于全量群: 用主框架 data.db 中的 full_access_groups 记录 (与 /全量列表 同源)"""
-    if not event.is_group:
-        return False
-    gid = event.group_id or ''
-    if not gid:
-        return False
-    try:
-        from core.bot.manager import _bot_manager_ref
-        if not _bot_manager_ref:
-            return False
-        rows = _bot_manager_ref.get_full_access_groups() or []
-        for r in rows:
-            rid = r.get('group_id') if isinstance(r, dict) else r
-            if rid == gid:
-                return True
-    except Exception:
-        pass
-    return False
-
-
 # ==================== 子命令: 数字类 (老项目纯文本格式) ====================
 
 def _cmd_random_1_100():
@@ -466,12 +443,6 @@ def _cmd_rn(args):
          name='rd-随机抽取',
          desc='[仅全量] 随机/算式插件 (本地沙箱, 输出严格脱敏)')
 async def cmd_rd(event, match):
-    # 群场景: 仅全量群可触发 (私信不限)
-    if event.is_group and not _is_full_volume_group(event):
-        btn = [[{'text': '全量消息授权', 'data': '全量申请', 'style': 4}]]
-        await event.reply("ℹ 此功能仅全量群可用", btn)
-        return
-
     raw = match.group(1)
     args = raw.split() if raw else []
 
