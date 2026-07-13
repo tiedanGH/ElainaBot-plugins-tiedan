@@ -243,7 +243,7 @@ async def time_main(event, match):
         if err:
             await _reply(event, f"❌ {err}\n请主人用 /t 时区 <IANA时区ID> 修复")
             return
-        suffix = f"\n({tz_name}时间)" if tz_name else ""
+        suffix = f"\n（{tz_name}时间）" if tz_name else ""
         await _reply(event, f"铁蛋现在的时间为：\n{formatted}{suffix}")
         return
 

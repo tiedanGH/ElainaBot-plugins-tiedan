@@ -144,3 +144,37 @@ async def six_buttons(event, match):
         ],
     ]
     await event.reply("# 按钮测试", buttons=buttons)
+
+
+# ==================== 点我 → 弹窗提示词测试 ====================
+
+# _CATGIRL_OPEN = 'catgirl_open'   # 点我按钮回调 data
+
+
+# @handler(r'^/?点我$', name='点我', desc='发送一个按钮, 点击弹出提示词选项')
+# async def catgirl_entry(event, match):
+#     buttons = [[{'text': '点我', 'data': _CATGIRL_OPEN, 'type': 1, 'style': 1}]]
+#     await event.reply("点击下方按钮 👇", buttons=buttons)
+
+
+# @handler(rf'^{_CATGIRL_OPEN}$', name='点我回调',
+#          desc='点我按钮 → 回复问题 + 两个选项按钮',
+#          event_types=['INTERACTION_CREATE'])
+# async def catgirl_prompt(event, match):
+#     await event.ack_interaction(code=0)
+#     # 注: QQ V2 群聊不支持 prompt_keyboard (输入框上方提示词), 服务端会丢弃该字段
+#     #     (实测只有 content 发出, 选项不渲染), 故改用消息内联 keyboard 按钮模拟弹出选项
+#     buttons = [[
+#         {'text': '是的', 'data': 'catgirl_yes', 'type': 1, 'style': 1},
+#         {'text': '我是', 'data': 'catgirl_me', 'type': 1, 'style': 1},
+#     ]]
+#     await event.reply("你是小猫娘吗？", buttons=buttons)
+
+
+# @handler(r'^catgirl_(yes|me)$', name='点我答案',
+#          desc='提示词选项回调 (仅 ack, 无任何响应)',
+#          event_types=['INTERACTION_CREATE'])
+# async def catgirl_answer(event, match):
+#     # 只 ack 防客户端超时提示, 不回复任何消息
+#     await event.ack_interaction(code=0)
+#     return
