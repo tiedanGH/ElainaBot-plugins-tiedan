@@ -36,7 +36,7 @@ except ImportError:
     safe_builtins = {}
     default_guarded_getiter = None
     safer_getattr = None
-    log.warning("RestrictedPython 未安装，智能算式功能将不可用（其他子命令正常）。安装组件: pip install RestrictedPython")
+    log.warning("RestrictedPython 未安装，智能算式功能将不可用。安装组件: pip install RestrictedPython")
 
 
 def _safe_getitem(obj, index):
@@ -91,7 +91,7 @@ _HELP = (
 )
 
 
-# ==================== 强制中断超时 (移植自老项目 timeout.py) ====================
+# ==================== 强制中断超时 ====================
 
 def _run_with_kill_timeout(fn, args, timeout):
     """同步运行 fn(*args), 超时用 ctypes 强制注入 TimeoutError 终止线程.
@@ -260,8 +260,8 @@ def _dice_compute(expression):
             )
 
     # ----- 第二层截断: 整体过长 (>500) → 用 eval_expression 替代 final_expr -----
-    # 老脚本: 100d6 这种会让 final_expr 爆长成 (1+3+5+...) 200+ 字符;
-    # 用 eval_expression (已求和的简化式) 替代避免整条消息超 QQ 单条上限
+    # 100d6 这种会让 final_expr 爆长成 (1+3+5+...) 200+ 字符;
+    # 用 eval_expression (已求和的简化式) 替代避免整条消息超 QQ 上限
     if not with_d:
         # 无骰子: 不显示展开 (避免直接回显用户原算式)
         display_expr = ''
@@ -444,8 +444,8 @@ def _cmd_rn(args):
 # ==================== 主入口 ====================
 
 @handler(r'^[/#]rd(?:\s+(.+?))?\s*$',
-         name='rd-随机抽取',
-         desc='[仅全量] 随机/算式插件 (本地沙箱, 输出严格脱敏)')
+         name='随机工具',
+         desc='随机骰子/智能算式 (/rd help 查看帮助)',)
 async def cmd_rd(event, match):
     raw = match.group(1)
     args = raw.split() if raw else []
