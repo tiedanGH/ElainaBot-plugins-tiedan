@@ -66,24 +66,8 @@ def _resolve_comb_exe():
 
 
 def _is_full_volume_group(event):
-    """判断是否位于全量群: 用主框架 data.db 中的 full_access_groups 记录 (与 /全量列表 同源)"""
-    if not event.is_group:
-        return False
-    gid = event.group_id or ''
-    if not gid:
-        return False
-    try:
-        from core.bot.manager import _bot_manager_ref
-        if not _bot_manager_ref:
-            return False
-        rows = _bot_manager_ref.get_full_access_groups() or []
-        for r in rows:
-            rid = r.get('group_id') if isinstance(r, dict) else r
-            if rid == gid:
-                return True
-    except Exception:
-        pass
-    return False
+    """判断是否位于全量群: 全量群的消息事件类型固定为 GROUP_MESSAGE_CREATE"""
+    return event.event_type == 'GROUP_MESSAGE_CREATE'
 
 
 async def _run_comb(subcommand, user_input):

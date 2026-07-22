@@ -21,32 +21,8 @@ KX_REPLIES = (
 
 
 def _is_full_volume_group(event):
-    """判断是否位于全量群: 查当前事件对应 bot 的 data.db full_access_groups 记录。
-
-    不能用 _bot_manager_ref.get_full_access_groups() —— 它固定取 _bots 里的第一个 bot,
-    多 bot 部署时会查错库。这里按 event.appid 定位到本条消息所属的 bot 再查其 db。
-    """
-    if not event.is_group:
-        return False
-    gid = event.group_id or ''
-    if not gid:
-        return False
-    try:
-        from core.bot.manager import _bot_manager_ref
-        if not _bot_manager_ref:
-            return False
-        bot = _bot_manager_ref.get_bot(event.appid)
-        log_service = getattr(bot, 'log_service', None) if bot else None
-        if not log_service:
-            return False
-        rows = log_service.query_data(
-            'SELECT 1 FROM full_access_groups WHERE group_id = ? LIMIT 1',
-            (gid,),
-        )
-        return bool(rows)
-    except Exception:
-        pass
-    return False
+    """判断是否位于全量群: 全量群的消息事件类型固定为 GROUP_MESSAGE_CREATE"""
+    return event.event_type == 'GROUP_MESSAGE_CREATE'
 
 
 @handler(r'^看戏$', name='看戏',
