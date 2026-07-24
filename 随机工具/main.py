@@ -1,4 +1,4 @@
-"""/rd 随机指令插件
+"""随机工具: /rd 随机骰子 / 智能算式 / 元素抽取
 
 安全原则: bot 输出 = (a) 硬编码模板 + (b) 机器随机数 + (c) 占位符。
 任何用户输入的字符串内容不进入输出。
@@ -9,6 +9,14 @@
             ASCII 白名单杜绝非 ASCII 进入展开式
             ctypes 强制中断超时保护
 """
+
+__plugin_meta__ = {
+    'name': '随机工具',
+    'author': '铁蛋',
+    'description': '随机骰子 / 智能算式 / 元素抽取',
+    'version': '1.0.0',
+}
+
 
 import re
 import math
@@ -21,7 +29,7 @@ from collections import Counter
 from core.plugin.decorators import handler
 from core.base.logger import get_logger, PLUGIN
 
-log = get_logger(PLUGIN, "rd")
+log = get_logger(PLUGIN, "随机工具")
 
 
 # ==================== 沙箱 (一次性导入) ====================
@@ -492,12 +500,5 @@ async def cmd_rd(event, match):
                 else:
                     result = err or "[执行失败]"
 
-    # 引用回复触发消息: 通过 kwargs 透传 message_reference 字段
-    # (sender._build_core_payload 末尾 payload.update(kwargs) 会把它合并进 payload)
-    kwargs = {}
-    if event.message_id:
-        kwargs['message_reference'] = {
-            'message_id': event.message_id,
-            'ignore_get_message_error': True,
-        }
-    await event.reply(result, **kwargs)
+    # markdown 不支持消息引用, 直接回复
+    await event.reply(result)
