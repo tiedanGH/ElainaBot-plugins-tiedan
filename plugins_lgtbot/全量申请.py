@@ -67,7 +67,7 @@ def _init_config():
     _ensure_config()
 
 _IMG = '![菜单头图 #300px #250px](https://qqbot.ugcimg.cn/102813815/9fd08ad10f048984fc0a9d36f71dd450e0780587/c7f24f5aeadfb1908561622d43de3169)'
-_INPUT_TIP = "1. 请群主点击我的头像\n2. 点击右上角齿轮设置\n3. 点击**可获取的群聊消息范围**设置为**获取群内全部消息**\n4.勾选**主动在群聊内发言**即可\n\n备选：<qqbot-cmd-input text='全量申请 ' show='请点击这里并输入群号' />\n>💡 授权后无需再点击按钮刷新会话\n需要9.2.90以上版本QQ设置哦！"
+_INPUT_TIP = "1. 请群主点击我的头像\n2. 点击右上角齿轮设置\n3. 点击**可获取的群聊消息范围**设置为**获取群内全部消息**\n4. 勾选**主动在群聊内发言**即可\n\n备选：<qqbot-cmd-input text='全量申请 ' show='请点击这里并输入群号' />\n>💡 授权后无需再点击按钮刷新会话\n需要9.2.90以上版本QQ设置哦！"
 _INVALID_GROUP_TIP = "群号过短，请重新输入：\n<qqbot-cmd-input text='全量申请 ' show='全量申请 群号' />"
 
 
@@ -129,7 +129,7 @@ async def apply_full_access(event, match):
         return await event.reply(f"<@{event.user_id}>\n当前群已开启全量消息，无需再次申请")
     bot_uin, bot_uid = _get_bot_uin_uid()
     if not bot_uin or not bot_uid:
-        return await event.reply(f"<@{event.user_id}>\n请先在插件配置 data/config.json 中填写 uin 和 uid")
+        return await event.reply(f"<@{event.user_id}>\n请先在插件配置 data/全量申请_config.json 中填写 uin 和 uid")
     url = _URL_TPL.format(group_code=group_code, bot_uin=bot_uin, bot_uid=bot_uid)
     msg = (
         "## 🔔 全量消息授权\n"
