@@ -14,7 +14,7 @@ __plugin_meta__ = {
     'name': '随机工具',
     'author': '铁蛋',
     'description': '随机骰子 / 智能算式 / 元素抽取',
-    'version': '1.0.0',
+    'version': '1.0.1',
 }
 
 
