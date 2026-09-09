@@ -3,13 +3,16 @@
 用法 (指定群内所有人可用):
     /upload                    引用压缩包消息 → 解压到 <上传目录>/<压缩包名>/
     /upload <文件夹名>          引用单文件消息 → 写入 <上传目录>/<文件夹名>/<文件名>
-    /upload force [文件夹名]    仅主人: 跳过内容审核直传 (force 可简写 f)
+    /upload force [文件夹名]    仅主人: 跳过内容审核与查重直传 (force 可简写 f)
     /upload help               查看指令帮助
     /compile <文件夹名>         重新编译 (仅上次是临时性编译失败时可用, 无需重传)
 
 内容查重 (app/flow.py): 下载后按 sha256 比对历史记录, 字节完全一致的包**直接拒收**
 且不进审核 —— 内容一个字节没改, 重传不会得出不同结论。提示里给出上次的记录号与
 那次的结果 (无论上次是否过审)。上次是**临时性**编译失败时才引导到 /compile。
+**force 不受查重限制**: 那是主人的运维操作 (服务器侧出状况需要把同一个包重新落地
+一次), 查重本是替普通上传者省一轮无谓的审核, 挡运维没有意义。force 仍会算出并记下
+sha256, 否则后续记录会漏检这一份内容。
 
 重新编译 (/compile): 用途很窄 —— 编译进程被占用、编译服务未就绪这类**临时**失败,
 源码本身没问题而原样重传又会被查重拒收, 只能靠这条重来一次。编译失败的常态不是
@@ -106,7 +109,7 @@ __plugin_meta__ = {
     'name': 'LGTBot 自动部署',
     'author': '铁蛋',
     'description': '/upload 引用群文件上传到 lgtbot 目录, 自动内容审核 + 请求编译 + 目录权限管理',
-    'version': '1.11.0',
+    'version': '1.11.1',
 }
 
 log = get_logger(PLUGIN, 'LGTBot自动部署')
@@ -126,7 +129,7 @@ _ICON = (
 # owner_only 由框架把关 —— 非主人命中时框架直接回「仅主人」模板并终止匹配链
 # (见 core/plugin/_dispatch.py), 所以普通处理器不会把 force 误当成文件夹名。
 @handler(r'^/?upload\s+(?i:force|f)(?:\s+([\s\S]+))?$', name='LGTBot强制部署',
-         desc='/upload force [文件夹名] — 跳过内容审核直传 lgtbot (仅主人)',
+         desc='/upload force [文件夹名] — 跳过内容审核与查重直传 lgtbot (仅主人)',
          owner_only=True, group_only=True, ignore_at_check=True, priority=10, block=True)
 async def cmd_upload_force(event, match):
     await flow.handle(event, (match.group(1) or '').strip(), force=True)
