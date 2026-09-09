@@ -155,8 +155,10 @@ _CRITERIA = {
              '取值集合有限, 塞不进任意文字; 仅写服务端日志而不发送。\n'
              '**第一步: 先看参数是用什么 checker 声明的 —— 它决定了这个参数能装什么**。'
              '指令参数在 MakeStageCommand / MakeCommand 里由 checker 声明, 框架已经把取值域限死了:\n'
-             '  - `AnyArg(...)`、`BasicChecker<std::string>(...)` → 玩家自由文本, '
-             '**只有这类参数才可能构成 echo**;\n'
+             '  - `AnyArg(...)`、`BasicChecker<std::string>(...)` → 玩家自由文本。'
+             '这只是**入场券, 不是证据** —— 绝大多数自由文本参数都是坐标、名称之类, '
+             '解析完就丢了, 完全正常。看到 `AnyArg` 不要激动, 它**本身不构成任何违规**, '
+             '只是说明这个参数值得往下追一步;\n'
              '  - `AlterChecker<T>({...})` 只能取映射表里预先写死的值; '
              '`ArithChecker<T>(min, max, ...)` 只能取范围内的数; `EnumChecker<E>` / '
              '`FlagsChecker<E>` 只能取枚举; `BoolChecker(...)` 只有真假; '
@@ -165,7 +167,9 @@ _CRITERIA = {
              '  - `RepeatableChecker<C>` / `FixedSizeRepeatableChecker<C>` / '
              '`OptionalChecker<C>` / `OptionalDefaultChecker<C>` / `BatchChecker<...>` '
              '是包装器, 看内层 C 属于上面哪一类。\n'
-             '所以: **一个函数若没有自由文本参数, 直接跳过**, 不必再看它的发送调用。\n'
+             '所以这一步只用来**缩小范围**: 没有自由文本参数的函数直接跳过, 不必再看它的'
+             '发送调用; 有自由文本参数的也**只是进入下一步**, 判不判违规完全取决于下面'
+             '「它到底有没有走进发送调用」的核查结果。\n'
              '**下面这些发送内容由框架自产, 不是玩家自填, 一律不算**: '
              '`Global().PlayerName(...)`、`Global().PlayerAvatar(...)`、`At(PlayerID(...))`、'
              '`Markdown(...)` 里由代码拼出的 HTML, 以及靠枚举查表得到的固定文案。\n'
@@ -299,18 +303,133 @@ def _origin_scan_block(hits: int) -> str:
             '**未检出**任何 原作/作者/出处/原创/改编自/取材于 字样。')
 
 
+# 输入回显的确定性预扫描。与 origin 那套同理: 把一个**客观事实**在本地算好再告诉模型
+# 三轮提示词加固都没能治住小模型的「参数是 AnyArg → 判 echo」式臆断, 它甚至会一边写
+# 「虽未直接回显」一边把 verdict 填成 reject。
+#
+# 只判「直接回显」这一种形态: 玩家输入的字符串标识符, 有没有和某个发送调用出现在
+# **同一条语句**里。这是直接回显的**必要条件** —— 输入要被发出去, 它的名字总得出现在
+# 那条发送语句里。一个都找不到, 直接回显就客观不成立。
+# (经中间变量洗一道的形态本扫描覆盖不到, 所以结论措辞里明确留了那条口子。)
+#
+# 候选**只以函数参数为种子**, 再沿赋值传播:
+#   · 种子 = 形参位置的 std::string (标识符后面跟着 `,` 或 `)`)。玩家输入只能从这里
+#     进来。局部变量与函数返回值不做种子 —— 代码本来就大量发送自己拼的 std::string
+#     (棋盘 HTML、战报、提示文案), 把它们算进来会让每个包都命中, 这个扫描就废了。
+#   · 传播 = 任何 `X = …种子…` / `X += …种子…` 都把 X 也算进来, 迭代到不动点。
+#     这条覆盖「先洗进局部变量或成员变量再发出去」那种形态 (1.9.4 踩过的那类),
+#     否则只查种子本身会漏判。
+_CODE_EXTS = ('.cc', '.cpp', '.cxx', '.h', '.hpp', '.hh', '.inl')
+_STR_PARAM_RE = re.compile(r'std::string\s*&?\s*(\w+)\s*[,)]')
+_PROPAGATE_ROUNDS = 3
+# 发送调用: 函数形态 reply()/Tell()/Boardcast() 等, 以及 `auto sender = ...; sender << x`
+_SEND_CALL_RE = re.compile(r'\b(?:reply|Tell|Boardcast|Broadcast|SendMsg|send)\s*\(|'
+                           r'\bsender\s*<<')
+_MAX_SEND_STMT_LINES = 12        # 一条 << 链再长也就这么多行, 防坏文件把扫描拖死
+
+
+def _send_statements(text: str):
+    """逐条抽出发送语句, 产出 ``(行号, 语句文本)``。
+
+    从**发送调用本身**起算而不是整行起算: ``if (!Parse(s, v)) { reply() << "错误"; }``
+    这种写法里, ``s`` 出现在同一行但明显不在发送参数里, 从调用处起算才不会误命中。
+    """
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        m = _SEND_CALL_RE.search(line)
+        if not m:
+            continue
+        stmt = line[m.start():]
+        j = i
+        while ';' not in stmt and j + 1 < len(lines) and j - i < _MAX_SEND_STMT_LINES:
+            j += 1
+            stmt += '\n' + lines[j]
+        yield i + 1, stmt
+
+
+def _tainted_names(content: str) -> set:
+    """字符串形参 + 由它们赋值出来的变量 (迭代到不动点, 见上方注释)。"""
+    names = set(_STR_PARAM_RE.findall(content))
+    for _ in range(_PROPAGATE_ROUNDS):
+        if not names:
+            break
+        src = re.compile(r'(\w+)\s*\+?=[^;\n]*\b(?:'
+                         + '|'.join(re.escape(n) for n in names) + r')\b')
+        grown = names | set(src.findall(content))
+        if grown == names:
+            break
+        names = grown
+    return names
+
+
+def scan_echo_sends(pkg: dict) -> dict:
+    """扫描包内代码: 玩家输入 (或由它派生的变量) 有没有出现在某条发送语句里。
+
+    返回 ``{files, names, hits}``: ``hits`` 是 ``(路径, 行号)`` 列表, 空表示本包内
+    **没有任何一条发送语句提到过玩家输入** —— 回显不成立。
+    """
+    files = names = 0
+    hits = []
+    for t in pkg.get('texts') or []:
+        path = str(t.get('path') or '')
+        if not path.lower().endswith(_CODE_EXTS):
+            continue
+        content = t.get('content') or ''
+        if not content:
+            continue
+        files += 1
+        cand = _tainted_names(content)
+        names += len(cand)
+        if not cand:
+            continue
+        word = re.compile(r'\b(?:' + '|'.join(re.escape(n) for n in cand) + r')\b')
+        for lineno, stmt in _send_statements(content):
+            if word.search(stmt):
+                hits.append((path, lineno))
+    return {'files': files, 'names': names, 'hits': hits}
+
+
+def _echo_scan_block(scan: dict) -> str:
+    """把本地扫描结论作为可信事实写进系统提示词。"""
+    if not scan or not scan.get('files'):
+        return ''
+    hits = scan.get('hits') or []
+    if hits:
+        loc = ', '.join(f'{p}:{n}' for p, n in hits[:8])
+        more = f' 等 {len(hits)} 处' if len(hits) > 8 else ''
+        return ('【本地预扫描 · 输入回显】系统用确定性规则追踪了字符串形参及其派生变量, '
+                f'发现这些位置的发送语句里出现了它们: {loc}{more}。这只是**可疑点清单, '
+                '不是结论** —— 同名变量、经解析后重建的值都可能命中。请照标准逐条核对, '
+                '判定以你读到的代码为准。')
+    return ('【本地预扫描 · 输入回显】系统用确定性规则做过这样一次追踪: 先取出本包 '
+            f'{scan["files"]} 个代码文件里全部字符串形参 (玩家输入只能从这里进来), '
+            '再把「由它们赋值出来的变量」一并标记, 迭代到不动点, 共 '
+            f'{scan["names"]} 个标识符; 然后逐条比对每一条发送语句 '
+            '(reply / Tell / Boardcast / sender 等)。结果是: '
+            '**没有任何一条发送语句里出现过它们中的任何一个**。\n'
+            '这是客观事实 —— 本包的输入回显**已被排除**。你**不得**以「参数是 AnyArg / '
+            '自由文本」「未做字符集限制」「若被拼接则构成回显」「存在注入风险」为由判 '
+            'echo: 这些说的都是可能性, 而本条只处罚**已经发生**的回显。\n'
+            '扫描覆盖不到的只剩一种极端情形: 输入经由函数出参或容器辗转传出, 全程没有'
+            '出现在任何赋值右侧。要判这种, 必须在 reason 里**同时**原样引用「把输入写进'
+            '该变量的那一行」与「发出该变量的那一行」。两样都引用不出就不能判 echo。')
+
+
 def criteria_keys(mode: str) -> tuple:
     """本次审核适用的标准 (也就是允许出现的拒绝分类)。"""
     return FILE_CRITERIA if mode == 'file' else ARCHIVE_CRITERIA
 
 
 def build_system_prompt(mode: str, extra: str = '', nonce: str = '',
-                        origin_marks: int | None = None) -> str:
+                        origin_marks: int | None = None,
+                        echo_scan: dict | None = None) -> str:
     """按上传模式拼装系统提示词: 不适用的标准根本不进提示词。
 
     ``nonce`` 为本次请求的校验值, 同时用于定界符声明与输出回显 (见模块 docstring L2/L4)。
-    ``origin_marks`` 为 ``count_origin_marks`` 的本地扫描结果, 给出后会附一段可信事实,
-    堵死「rule.md 明明有标注却被判缺少标注」这类幻觉; 单文件模式不含标准一, 会被忽略。
+    ``origin_marks`` / ``echo_scan`` 是两处本地确定性扫描的结果 (见
+    ``count_origin_marks`` / ``scan_echo_sends``), 给出后各附一段可信事实, 分别堵死
+    「rule.md 明明有标注却被判缺少标注」与「参数是 AnyArg 就判回显」这两类臆断。
+    不适用的模式会自动忽略 (单文件不含标准一)。
     面板的「补充要求」由管理员填写, 属可信来源, 但仍排在安全规则之后, 不能覆盖它。
     """
     keys = criteria_keys(mode)
@@ -321,6 +440,10 @@ def build_system_prompt(mode: str, extra: str = '', nonce: str = '',
         parts.append(f'【标准{_CN_NUM[i]} · {title}】\n{body}')
     if 'origin' in keys and origin_marks is not None:
         parts.append(_origin_scan_block(origin_marks))
+    if 'echo' in keys and echo_scan is not None:
+        block = _echo_scan_block(echo_scan)
+        if block:
+            parts.append(block)
     cats = ' | '.join(f'"{k}"' for k in keys + _EXTRA_CATEGORIES)
     parts.append(_OUTPUT_FORMAT.format(cats=cats, n=len(keys), nonce=nonce,
                                        origin_exc=_ORIGIN_EXC if 'origin' in keys else '。'))
@@ -703,7 +826,7 @@ async def review(pkg: dict, meta: dict, cfg: dict) -> dict:
     # 中央会把它与自己的 runtime_prompt 合并后放到系统位, 两边都写就重复了。
     nonce = secrets.token_hex(8)
     system_prompt = build_system_prompt(mode, cfg.get('review_prompt'), nonce,
-                                        count_origin_marks(pkg))
+                                        count_origin_marks(pkg), scan_echo_sends(pkg))
     messages = [{'role': 'user', 'content': _build_digest(pkg, meta, nonce)}]
     resp, info = await central.complete(messages, system_prompt, cfg)
     base['elapsed'] = round(time.time() - start, 1)
