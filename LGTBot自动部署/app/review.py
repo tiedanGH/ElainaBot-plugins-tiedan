@@ -153,6 +153,22 @@ _CRITERIA = {
              '玩家昵称与 @ (非玩家自填); 把输入**解析或校验成受限取值后**再输出该取值 '
              '(坐标、数字、枚举、白名单内的选项名 —— 发出去的是代码重新格式化的结果, 不是原串) —— '
              '取值集合有限, 塞不进任意文字; 仅写服务端日志而不发送。\n'
+             '**第一步: 先看参数是用什么 checker 声明的 —— 它决定了这个参数能装什么**。'
+             '指令参数在 MakeStageCommand / MakeCommand 里由 checker 声明, 框架已经把取值域限死了:\n'
+             '  - `AnyArg(...)`、`BasicChecker<std::string>(...)` → 玩家自由文本, '
+             '**只有这类参数才可能构成 echo**;\n'
+             '  - `AlterChecker<T>({...})` 只能取映射表里预先写死的值; '
+             '`ArithChecker<T>(min, max, ...)` 只能取范围内的数; `EnumChecker<E>` / '
+             '`FlagsChecker<E>` 只能取枚举; `BoolChecker(...)` 只有真假; '
+             '`VoidChecker(...)` 根本不带值 —— 这些参数**装不下任意文字, 一律不可能 echo**, '
+             '哪怕它们被原样发出去也不算;\n'
+             '  - `RepeatableChecker<C>` / `FixedSizeRepeatableChecker<C>` / '
+             '`OptionalChecker<C>` / `OptionalDefaultChecker<C>` / `BatchChecker<...>` '
+             '是包装器, 看内层 C 属于上面哪一类。\n'
+             '所以: **一个函数若没有自由文本参数, 直接跳过**, 不必再看它的发送调用。\n'
+             '**下面这些发送内容由框架自产, 不是玩家自填, 一律不算**: '
+             '`Global().PlayerName(...)`、`Global().PlayerAvatar(...)`、`At(PlayerID(...))`、'
+             '`Markdown(...)` 里由代码拼出的 HTML, 以及靠枚举查表得到的固定文案。\n'
              '**判定必须从发送调用出发, 不能从输入变量出发**: 先找出每一处发送调用, '
              '再看它的实参里有没有玩家输入的字符串**本身** (或它的子串、与它拼接的结果)。'
              '「函数签名里有 std::string 参数」「某个值源自玩家输入」都**不是**违规 —— '
@@ -169,10 +185,14 @@ _CRITERIA = {
              '若每一处赋值都是由游戏状态渲染而来 (渲染函数只接受枚举/整数, 状态结构里也没有'
              '存放玩家输入的字符串字段), 那它装不下玩家输入, **不是** echo。'
              '「该变量可能包含输入」「状态里含玩家输入」这类没有赋值处佐证的推断一律不成立。\n'
-             '**判 echo 前必须取证**: 在 reason 里**原样引用那一行发送调用的代码**, '
-             '并指明其中哪个实参是玩家输入的字符串; 若实参是中间变量, 还要**一并引用'
-             '把输入写进该变量的那一行赋值**。引用不出这两样就不能判 echo —— '
-             '禁止仅凭「函数接收了玩家输入」「存在被回显的风险」下判定。\n'
+             '**判 echo 前必须取证 —— 只给行号不算取证**: 在 reason 里把那一行发送调用的'
+             '代码**原样抄下来**, 而且抄出来的那一行里必须**真的出现该自由文本参数的标识符**。'
+             '若实参是中间变量, 还要一并抄上把输入写进该变量的那一行赋值。'
+             '「在第 N 行通过 X 发送」这种只报位置不抄代码的写法**不成立**; '
+             '抄出来的那行里根本找不到那个标识符的, 同样不成立 —— 说明你记错了行, '
+             '此时应当放弃这条 finding, 而不是改口用「存在风险」凑一条。\n'
+             '禁止仅凭「函数接收了玩家输入」「参数未经字符集限制」「存在被回显/注入的风险」'
+             '下判定 —— 这些说的都是**可能性**, 而本条只处罚**已经发生**的回显。\n'
              'findings 里写明是哪个文件、哪一行的发送调用。→ 分类 echo。'),
     'copyright': ('版权审查 (仅依据文字内容)',
                   '仅依据送审的**文字内容**做版权判断:\n'
@@ -236,7 +256,8 @@ findings 填写要求 (每一处问题单独一条):
 - target: 只写文件在包内的相对路径 (与文件清单一致), **严禁把违规内容原文写进 target**;
 - line: 违规所在行号 (送审文本每行已带 "行号|" 前缀, 直接引用该数字); 整个文件性质的问题填 0;
 - suspect: 明确违规填 false, 疑似违规 (擦边、需人工复核) 填 true;
-- reason: 简要说明违反哪条规则, 仅供后台留档, 不会公开展示。"""
+- reason: 说明为什么不通过。要写得具体、可据以修改: 说清是哪条标准、问题在哪、该怎么改。
+  需要举证时**只引用代码行**,**不要**把违规文案本身抄进来 —— 报告页不该二次传播违规内容。"""
 
 # 「判断依据不足 → reject」的兜底会压过标准一的从宽原则, 故在含 origin 的模式里
 # 单独给它开例外; 不含 origin 的模式 (单文件) 不提这条, 免得凭空冒出不存在的标准。
@@ -572,13 +593,34 @@ def criteria_label_map() -> dict:
 _TARGET_BAD = re.compile(r'[\r\n\t"\'`<>]')
 
 
-def _norm_findings(value, allowed: tuple) -> list:
-    """规整 findings 为 [{category, target, line, suspect}]。
+# reason 的去向, 改这块前先看清楚:
+#   ✔ 网页报告 (app/report.py) 与后台留档 —— **允许原样展示模型给的说明**。
+#     报告页正是给上传者看「为什么不通过」的, 只有分类和行号等于什么都没说。
+#     那边 report._esc 会对每一个字做 HTML 转义, 展示原文不构成 XSS。
+#   ✘ **bot 发出的任何消息 (群消息 / 私信) 绝对不许带上它**。reason 是模型对
+#     不可信上传物的复述, 可能夹带违规原文、伪造的 <@openid>、伪造的多行消息 ——
+#     进了 bot 消息就等于借 bot 之口把违规内容播出去, 而本插件存在的意义就是拦这个。
+#     群消息只用 category / target / line, 见 flow._finding_lines。
+_REASON_MAX = 600
 
-    group 消息与面板只展示这里清洗过的字段: target 剥掉引号/换行等非路径字符并
-    截断, line 强转非负整数 —— 即使模型违规把原文塞进来, 也只会剩下一段截断的
-    "疑似路径", 不会把违规内容原样带进群聊。reason 不进入该结构 (完整原文在
-    data/reviews/ 留档里)。
+
+def _clean_reason(text) -> str:
+    """净化 finding 的 reason (只面向网页报告与后台, 不面向 bot 消息)。
+
+    只去控制字符、把换行折成空格、截断。**不剥 `<>`** —— echo 标准要求模型原样
+    引用代码, 剥掉会把 C++ 模板绞成一团; 网页那边由 report._esc 全量转义兜底。
+    正因为不剥, 它更不能进 bot 消息 (见上方注释)。
+    """
+    s = _CTRL_RE.sub('', str(text or '')).replace('\r', ' ').replace('\n', ' ')
+    return ' '.join(s.split())[:_REASON_MAX]
+
+
+def _norm_findings(value, allowed: tuple) -> list:
+    """规整 findings 为 [{category, target, line, suspect, reason}]。
+
+    target 剥掉引号/换行等非路径字符并截断, line 强转非负整数 —— 即使模型违规把
+    原文塞进 target, 也只会剩下一段截断的"疑似路径"。这两个字段是群消息用的。
+    reason 另按 _clean_reason 处理, **只供网页报告与后台**, 见上方注释。
     """
     out = []
     if not isinstance(value, list):
@@ -597,6 +639,7 @@ def _norm_findings(value, allowed: tuple) -> list:
             'target': target or '(未标注位置)',
             'line': line,
             'suspect': bool(item.get('suspect')),
+            'reason': _clean_reason(item.get('reason')),
         })
     return out[:20]
 

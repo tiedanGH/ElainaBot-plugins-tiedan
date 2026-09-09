@@ -563,7 +563,13 @@ _MAX_SHOWN_FINDINGS = 8
 
 
 def _finding_lines(record: dict) -> list:
-    """违规位置列表 (只含分类 + 文件 + 行号, 绝不含违规内容原文)。"""
+    """违规位置列表 (只含分类 + 文件 + 行号, 绝不含违规内容原文)。
+
+    **不要往这里加 finding['reason']**。那是模型对不可信上传物的复述, 可能夹带
+    违规原文、伪造的 <@openid>、伪造的多行消息 —— 让 bot 把它播进群, 等于本插件
+    亲手干了它要拦的事。要给上传者看说明, 走网页报告 (app/report.py, 那边逐字
+    HTML 转义)。见 review._norm_findings 上方的注释。
+    """
     findings = record.get('findings') or []
     lines = []
     for i, f in enumerate(findings[:_MAX_SHOWN_FINDINGS], 1):

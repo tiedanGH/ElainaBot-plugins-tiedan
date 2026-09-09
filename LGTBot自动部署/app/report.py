@@ -176,8 +176,15 @@ def build_review(record: dict, result: dict) -> str:
 
 
 def _findings_table(findings) -> str:
+    """违规明细表。
+
+    这里是**唯一**会把模型给的 reason 展示出来的地方 —— 报告页存在的意义就是让
+    上传者看到「为什么不通过」, 只有分类和行号等于什么都没说。reason 逐字过 _esc,
+    展示原文不构成 XSS。对应地, bot 发出的消息里绝不能带它 (见 flow._finding_lines)。
+    """
     if not findings:
         return ''
+    has_reason = any(str(f.get('reason') or '').strip() for f in findings)
     rows = []
     for i, f in enumerate(findings, 1):
         label = review.CATEGORY_LABELS.get(f.get('category'), '其他')
@@ -186,13 +193,14 @@ def _findings_table(findings) -> str:
         loc = str(f.get('target') or '(未标注位置)')
         if f.get('line'):
             loc += f':{f["line"]}'
-        rows.append(f'<tr><td class="n">{i}</td>'
-                    f'<td><span class="tag">{_esc(label)}</span></td>'
-                    f'<td class="mono">{_esc(loc)}</td>'
-                    f'<td>{_esc(f.get("reason") or "")}</td></tr>')
-    table = ('<table><tr><th>#</th><th>分类</th><th>位置</th><th>说明</th></tr>'
-             + ''.join(rows) + '</table>')
-    return _sec(f'违规明细 ({len(findings)} 处)', table)
+        cells = (f'<td class="n">{i}</td>'
+                 f'<td><span class="tag">{_esc(label)}</span></td>'
+                 f'<td class="mono">{_esc(loc)}</td>')
+        if has_reason:
+            cells += f'<td>{_esc(f.get("reason") or "")}</td>'
+        rows.append(f'<tr>{cells}</tr>')
+    head = '<tr><th>#</th><th>分类</th><th>位置</th>' + ('<th>说明</th>' if has_reason else '') + '</tr>'
+    return _sec(f'违规明细 ({len(findings)} 处)', f'<table>{head}{"".join(rows)}</table>')
 
 
 # ==================== 编译失败 ====================
