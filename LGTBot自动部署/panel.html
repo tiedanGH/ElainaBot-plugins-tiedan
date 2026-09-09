@@ -187,6 +187,7 @@ pre.raw{background:var(--card2);border:1px solid var(--border);border-radius:12p
           <input id="compile_key" type="password" placeholder="留空表示不修改">
         </div>
         <div class="field" style="max-width:150px"><label>等待超时(秒)</label><input id="compile_timeout" type="number" min="30" max="590" step="10"></div>
+        <button class="btn btn-line" id="btn-compile-test" onclick="testCompile()">测试接口</button>
       </div>
       <div class="grid2" style="margin-top:14px">
         <label class="switch"><input type="checkbox" id="compile_enabled"> 部署成功后自动请求编译</label>
@@ -195,7 +196,9 @@ pre.raw{background:var(--card2);border:1px solid var(--border);border-radius:12p
         审核通过并部署后按游戏名请求单目标编译（同步等待）：新游戏走完整编译，老游戏走增量编译。<br>
         <b>新游戏</b>编译成功后自动请求 LGTBot 计划重启（维护模式 + 自动模式）：剩余对局清空后由 LGTBot 自行重启，本插件只发起请求、不跟踪重启是否发生。<br>
         编译失败 / 超时 / 异常才 @ 开发者排查；编译与计划重启的结果、API 返回解析一并写入审核记录与留档。<br>
+        「测试接口」走只读的 <code>/build/status</code>，只探测服务此刻可不可用，<b>不会触发任何编译</b>。
       </div>
+      <div id="compile-test-result" class="result"></div>
     </div>
 
     <div class="card">
@@ -428,6 +431,34 @@ async function testConn(){
   if(stale)msg+='<br>'+stale+'，已改由中央自动选择';
   else if(r.auto_selected)msg+='<br>ℹ️ 本次由中央按优先级自动选择（接口或模型留了「自动选择」）';
   show($('test-result'),true,msg);
+}
+
+/* 探测编译服务。走只读的 /build/status，不触发编译。
+   HTTP 200 只说明探到了，服务可不可用看响应体的 available —— 两者要分开报，
+   否则「连上了但引擎在用预编译包」会被误读成一切正常。 */
+async function testCompile(){
+  const btn=$('btn-compile-test');setBusy(btn,true);
+  /* 送当前输入框里的地址与密钥（可能还没保存）；密钥留空 = 沿用已保存的那把 */
+  const r=await api('/compile/test','POST',
+    {compile_url:$('compile_url').value.trim(),compile_key:$('compile_key').value});
+  setBusy(btn,false,'测试接口');
+  const el=$('compile-test-result');
+  const dump=d=>'<pre class="raw" style="margin-top:8px">'+esc(JSON.stringify(d,null,2))+'</pre>';
+  if(!r.success)
+    return show(el,false,'❌ 探测失败'+(r.http_status?'（HTTP '+r.http_status+'）':'')+'：'
+      +esc(r.error||'')+(r.data&&Object.keys(r.data).length?dump(r.data):''));
+  const d=r.data||{};
+  const b=d.build||{};
+  let msg=d.available?'✅ 编译服务可用':'⚠️ 探测成功，但服务当前不可用：'+esc(d.reason||'未说明原因');
+  if(!d.available&&d.compile_status)msg+='（此刻发起编译会得到 HTTP '+d.compile_status+'）';
+  const bits=[];
+  if(d.building)bits.push('正在编译中'+(b.cmd_display?'：<code>'+esc(b.cmd_display)+'</code>':'')
+    +(b.started_iso?'，起于 '+esc(b.started_iso):''));
+  else if(b.finished)bits.push('上次编译已结束'+(b.returncode!=null?'，退出码 '+b.returncode:'')
+    +(b.elapsed_sec!=null?'，用时 '+b.elapsed_sec+'s':''));
+  if(d.active_matches!=null)bits.push('进行中对局 '+d.active_matches);
+  if(bits.length)msg+='<br>'+bits.join('；');
+  show(el,d.available===true,msg+dump(d));
 }
 
 /* ==================== 审核记录 ==================== */

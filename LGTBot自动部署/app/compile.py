@@ -21,6 +21,11 @@
     - 504  服务端等待 600s 仍未结束 (进程保留)
   · ``POST /api/ext/lgtbot/build/terminate`` 强制中断当前编译
     - 200 {success: true, message} / 401 / 409 没有编译在进行 / 500 终止失败
+  · ``GET  /api/ext/lgtbot/build/status`` 只读探测编译服务此刻可不可用, 不触发任何动作
+    - 200 {success, available, reason, compile_status, building, build, mode, active_matches}
+      HTTP 恒 200 = 探测本身成功; 服务可不可用看响应体的 available (与 compile 同源
+      判定, 不会出现探测说可用、紧接着 compile 就 409) / 401 token 缺失或错误
+      只给面板的「测试接口」按钮用 (见 probe_status), 不入上传流程、不写记录
   · ``POST /api/ext/lgtbot/planned-restart`` 开 / 关计划重启维护模式
     (webui/restart_api.py, 与编译 API 同一枚 token)
     body ``{"enable": bool, "auto": bool=false, "reason": "文本(≤200)"}``
@@ -60,10 +65,12 @@ from . import config
 _TARGET_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_\-]{0,62}$')
 
 _COMPILE_PATH = '/api/ext/lgtbot/build/compile'
+_STATUS_PATH = '/api/ext/lgtbot/build/status'
 _TERMINATE_PATH = '/api/ext/lgtbot/build/terminate'
 _PLANNED_RESTART_PATH = '/api/ext/lgtbot/planned-restart'
 _TERMINATE_TIMEOUT = 15
 _RESTART_TIMEOUT = 20
+_STATUS_TIMEOUT = 10     # 只读探测, 面板点了要立刻有反馈, 不跟编译那套长等待
 _REASON_MAX = 200        # 与 restart_api._REASON_MAX 一致, 超长由服务端截断
 
 
@@ -136,6 +143,42 @@ async def terminate(cfg: dict) -> dict:
                     'message': str(data.get('message') or data.get('error') or text[:200])}
     except Exception as e:  # noqa: BLE001
         return {'ok': False, 'status': 0, 'message': f'{type(e).__name__}: {e}'}
+
+
+async def probe_status(cfg: dict) -> dict:
+    """``GET /build/status`` —— 只读探测编译服务此刻可不可用, 不触发任何动作。
+
+    只给面板的「测试接口」按钮用: 不写审核记录、不进留档, 也不参与上传流程。
+    HTTP 200 只代表**探测本身**成功, 服务可不可用要看响应体的 ``available``
+    (与 compile 同源判定, 所以不会出现探测说可用、紧接着 compile 就 409)。
+
+    返回 ``{ok, http_status, error, data}``: ``ok`` 仅表示这次探测拿到了 200 +
+    可解析的 JSON; ``data`` 是 API 原样返回的对象, 交给面板展示。
+    """
+    cfg_err = url_error(cfg)
+    if cfg_err:
+        return {'ok': False, 'http_status': 0, 'error': cfg_err, 'data': {}}
+    url = base_url(cfg) + _STATUS_PATH
+    try:
+        timeout = aiohttp.ClientTimeout(total=_STATUS_TIMEOUT)
+        async with aiohttp.ClientSession(timeout=timeout) as s, \
+                s.get(url, headers=_headers(cfg)) as resp:
+            text = await resp.text()
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                return {'ok': False, 'http_status': resp.status, 'data': {},
+                        'error': f'返回的不是 JSON (HTTP {resp.status}): {text[:200]}'}
+            if resp.status != 200:
+                return {'ok': False, 'http_status': resp.status, 'data': data,
+                        'error': str(data.get('error') or f'HTTP {resp.status}')}
+            return {'ok': True, 'http_status': 200, 'error': '', 'data': data}
+    except asyncio.TimeoutError:
+        return {'ok': False, 'http_status': 0, 'data': {},
+                'error': f'等待 {_STATUS_TIMEOUT} 秒无响应'}
+    except Exception as e:  # noqa: BLE001
+        return {'ok': False, 'http_status': 0, 'data': {},
+                'error': f'{type(e).__name__}: {e}'}
 
 
 async def request_compile(game: str, cfg: dict, is_new: bool = False) -> dict:

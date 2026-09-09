@@ -10,6 +10,7 @@ from core.base.logger import PLUGIN, get_logger
 from core.plugin.web_pages import register_route
 
 from . import central, config, deploy, review, store
+from . import compile as compilemod
 
 log = get_logger(PLUGIN, 'LGTBot自动部署')
 
@@ -20,6 +21,7 @@ def register_routes():
     register_route('GET', PREFIX + '/config', _get_config)
     register_route('POST', PREFIX + '/config', _set_config)
     register_route('POST', PREFIX + '/test', _test_connection)
+    register_route('POST', PREFIX + '/compile/test', _test_compile)
     register_route('GET', PREFIX + '/models', _get_models)
     register_route('GET', PREFIX + '/records', _get_records)
     register_route('GET', PREFIX + '/record', _get_record)
@@ -66,6 +68,25 @@ async def _test_connection(request: web.Request):
     body = await _json(request)
     result = await central.probe(str(body.get('provider_id') or ''),
                                  str(body.get('model') or ''))
+    return web.json_response({'success': result.get('ok', False), **result})
+
+
+async def _test_compile(request: web.Request):
+    """探测 LGTBot 编译服务此刻可不可用 (GET /build/status, 只读, 不触发编译)。
+
+    与 AI 那颗测试按钮同理: 面板把**当前输入框里**的地址与密钥一起提交, 测的就是
+    眼前填的那套, 而不是已保存的。密钥沿用 config 的「空串 = 不修改」语义 ——
+    那个输入框是 password 且默认留空表示沿用旧值, 所以空串回落到已保存的密钥,
+    否则每次想测都得把密钥重敲一遍。地址则允许清空 (= 回到本机自动地址)。
+    """
+    body = await _json(request)
+    cfg = dict(config.all_config())
+    if 'compile_url' in body:
+        cfg['compile_url'] = str(body.get('compile_url') or '').strip()
+    key = str(body.get('compile_key') or '').strip()
+    if key:
+        cfg['compile_key'] = key
+    result = await compilemod.probe_status(cfg)
     return web.json_response({'success': result.get('ok', False), **result})
 
 
