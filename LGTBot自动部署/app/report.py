@@ -33,6 +33,8 @@ from . import review, store
 log = get_logger(PLUGIN, 'LGTBot自动部署')
 
 LINK_TEXT = '📄 点击查看完整报告'
+# 重复上传拒收时递给对方的是**上次那份**报告, 措辞要说清是上次的
+LINK_TEXT_PREV = '📄 查看上次完整报告'
 
 _STYLE = """
 :root{--bg:#f6f7f9;--card:#fff;--fg:#1f2328;--dim:#656d76;--line:#d8dee4;
@@ -266,6 +268,21 @@ def _render(title: str, badge: str, cls: str, sub: str, rid: str, body: str) -> 
 def _filename(rid: str) -> str:
     """``<记录号>-<16 位随机>.html`` —— 随机串让 URL 不可枚举 (见模块 docstring)。"""
     return f'{store.safe_filename(rid) or "report"}-{os.urandom(8).hex()}.html'
+
+
+def existing_link(cfg: dict, record: dict, text: str = LINK_TEXT) -> str:
+    """给一条**历史**记录拼出它那份报告的链接; 拿不到就返回空串。
+
+    按**当前**配置的前缀重新拼, 而不是用记录里存的 ``report_url`` —— 面板换过域名
+    或路径之后, 旧记录里存的那条就指向不通了。文件不在 (被清理过) 也返回空串:递一个死链比不递更糟。
+    """
+    base = str((cfg or {}).get('report_base_url') or '').strip()
+    name = os.path.basename(str((record or {}).get('report_file') or ''))
+    if not base or not name:
+        return ''
+    if not os.path.isfile(os.path.join(store.REPORTS_DIR, name)):
+        return ''
+    return f'[{text}]({base.rstrip("/")}/{name})'
 
 
 def generate(cfg: dict, record: dict, kind: str, result: dict | None = None,

@@ -331,9 +331,12 @@ async def _pipeline(event, cfg: dict, ref: dict, record: dict, target: dict, fol
         record.update(stage='duplicate',
                       error=f'与记录 {dup.get("id")} 完全一致 (SHA256 相同), '
                             f'旧结论「{_record_outcome(dup)}」')
+        # 上次那份报告还在就一并递过去: 内容一个字节没改, 上次为什么没过原样适用
+        prev = report.existing_link(cfg, dup, report.LINK_TEXT_PREV)
         # 不 @ 部署人员: 重传同一个包纯属上传者操作失误, 没有任何要人工介入的地方
         return await _finish_fail(event, cfg, record, '重复上传, 已拒收',
-                                  suffix=_dup_tip(dup), notify=False)
+                                  suffix=_dup_tip(dup), extra=[prev] if prev else [],
+                                  notify=False)
 
     if cfg.get('keep_archive'):
         record['archive_file'] = store.save_archive(rid, fname, data)
