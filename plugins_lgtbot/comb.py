@@ -326,6 +326,17 @@ _FOOTER_DEFAULT = '> [记录模式] seed 已隐藏'
 # _FOOTER_DEFAULT = '> [仅记录模式] 出于安全考虑，详细内容请前往 KOOK 频道查看'
 
 
+# 非排行榜回复: 点击只把指令填进输入框,由用户补上种子再发。
+_BTN_COMB = [[{'text': 'comb', 'data': 'comb', 'type': 2, 'style': 1}]]
+
+# 排行榜回复: 三张榜互相跳转。data 都是完整可用指令, 加 enter 点击即发。
+_BTN_RANKS = [[
+    {'text': '手挖', 'data': 'comb 查询', 'type': 2, 'style': 1},
+    {'text': '机挖', 'data': 'comb 机挖查询', 'type': 2, 'style': 1},
+    {'text': '生草', 'data': 'comb 生草查询', 'type': 2, 'style': 1},
+]]
+
+
 async def _handle(event, sub, user_input):
     # 群场景: 仅全量群可触发 (私信不限)
     if event.is_group and not _is_full_volume_group(event):
@@ -341,14 +352,15 @@ async def _handle(event, sub, user_input):
     out = _mask_seed_line(out)
     if _is_leaderboard_query(user_input):
         out, footer = await _sanitize_leaderboard(out)
+        buttons = _BTN_RANKS
     else:
         # 拼装模式不产生排行榜行; 万一出现也按最严处理
-        out, footer = _mask_ranks(out), _FOOTER_DEFAULT
+        out, footer, buttons = _mask_ranks(out), _FOOTER_DEFAULT, _BTN_COMB
 
     if len(out) > _MAX_OUT:
         out = out[:_MAX_OUT] + '\n... (输出过长, 已截断)'
     # 代码块包裹: 避免 # / * / ` 等被当 markdown 渲染
-    await event.reply(f"```comb\n{out}\n```\n{footer}")
+    await event.reply(f"```comb\n{out}\n```\n{footer}", buttons)
 
 
 # ==================== 三个子命令 ====================
