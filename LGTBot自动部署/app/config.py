@@ -38,6 +38,7 @@ DEFAULTS = {
     # ---- 审核 (仅文字: 图片/字体等二进制资源不送审) ----
     'review_enabled': True,      # 关闭后不做内容审核, 直接部署 (仅用于上游故障应急)
     'review_prompt': '',         # 追加到内置审核标准之后的自定义要求
+    'echo_review': True,         # 关闭后整条「用户输入回显」不入提示词, 也不接受 echo 分类
     # ---- 编译 (对接 LGTBot_ElainaBot 的编译 API) ----
     'compile_enabled': True,     # 部署成功后自动请求编译
     'compile_url': '',           # 编译 API 地址, 留空 = 自动指向本机框架端口
@@ -70,6 +71,7 @@ _COMMENTS = {
     'keep_archive': '是否把原压缩包留档到 data/archives',
     'review_enabled': '是否启用内容审核 (关闭后直接部署)',
     'review_prompt': '追加到内置审核标准之后的自定义要求',
+    'echo_review': '是否审查「用户输入回显」(代码把玩家输入拼进发送内容); 关闭后该标准完全不参与审核, 适用于小模型在这条上反复误判时',
     'compile_enabled': '部署成功后是否自动请求 LGTBot 编译 API',
     'compile_url': '编译 API 地址, 留空 = 自动指向本机框架端口',
     'compile_key': '编译 API token (LGTBot 面板「引擎编译」页复制)',
@@ -91,7 +93,7 @@ _cache: dict | None = None
 _INT_FIELDS = ('max_archive_mb', 'max_uncompressed_mb', 'max_files',
                'text_budget', 'download_timeout', 'compile_timeout')
 _BOOL_FIELDS = ('enabled', 'keep_replaced_backup', 'keep_archive', 'review_enabled',
-                'compile_enabled')
+                'echo_review', 'compile_enabled')
 _LIST_FIELDS = ('allowed_groups', 'notify_users', 'required_files')
 # 密钥语义字段: 面板提交空串 = 不修改, null = 清除
 _SECRET_FIELDS = ('compile_key',)

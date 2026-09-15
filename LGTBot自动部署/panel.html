@@ -156,6 +156,7 @@ pre.raw{background:var(--card2);border:1px solid var(--border);border-radius:12p
       <div class="grid2" style="margin-top:14px">
         <label class="switch"><input type="checkbox" id="review_enabled"> 启用内容审核（关闭后直接部署，仅供上游故障应急）</label>
         <label class="switch"><input type="checkbox" id="keep_archive"> 留档原压缩包到 data/archives</label>
+        <label class="switch"><input type="checkbox" id="echo_review"> 审查「用户输入回显」（关闭后该标准完全不参与）</label>
       </div>
       <div class="field" style="margin-top:14px;margin-bottom:0">
         <label>补充审核要求（追加到内置审核标准之后，可留空）</label>
@@ -312,7 +313,7 @@ const TOKEN=new URLSearchParams(location.search).get('token')||'';
 const baseMatch=location.pathname.match(/^(.*)\/api\/web-pages\//);
 const API=(baseMatch?baseMatch[1]:'')+'/api/ext/lgtbotdeploy';
 
-const BOOLS=['enabled','keep_replaced_backup','review_enabled','keep_archive','compile_enabled'];
+const BOOLS=['enabled','keep_replaced_backup','review_enabled','echo_review','keep_archive','compile_enabled'];
 const NUMS=['temperature','max_archive_mb','max_uncompressed_mb','max_files','download_timeout','text_budget','compile_timeout'];
 const TEXTS=['upload_dir','review_prompt','compile_url','report_base_url'];
 const LISTS=['allowed_groups','notify_users','required_files'];
