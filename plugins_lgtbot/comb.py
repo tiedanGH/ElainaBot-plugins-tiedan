@@ -5,8 +5,9 @@
   card XX   → ../comb card XX    拼装毁灭者-card
   board XX  → ../comb board XX   拼装毁灭者-board
 
-排行榜 (对应 comb_Li2CO3.cpp 的 query_map): 参数以 查询 / 机挖查询 / 生草查询
-开头时 comb 不做拼装, 而是把对应记分文件排序后输出「高分前15」「低分前15」。
+排行榜 (对应 comb_Li2CO3.cpp 的 query_map): 参数**恰好等于** 查询 / 机挖查询 /
+生草查询 (可带 full / 完整 后缀) 时 comb 不做拼装, 而是把对应记分文件排序后
+输出「高分前15」「低分前15」; 带后缀时 seed 不做缩短, 完整显示。
 这两张榜里的 seed 全是群友自己敲进来的任意文本, 直接回群有合规风险。
 
 脱敏策略:
@@ -80,8 +81,13 @@ def _rank_seeds(text):
 
 # ==================== AI 审核 (中央 LLM) ====================
 
-# comb_Li2CO3.cpp 的 query_map: **以**这三个词之一开头就走排行榜分支。
-_QUERY_PREFIXES = ('查询', '机挖查询', '生草查询')
+# comb_Li2CO3.cpp 的 query_map 键。cpp 侧 get_scorefile_name 用 `m == key`
+# **严格相等** 判断 (旧版是 m.find(key)==0 前缀匹配), 判定前先剥掉尾部的
+# full / 完整。本函数必须与之逐字一致, 否则两边对同一条输入的理解会分叉:
+#   · 插件更宽松 → comb 吐的是拼装结果, 插件按榜单处理, 脚注和按钮全错
+#   · 插件更严格 → comb 吐的是榜单, 插件按非榜单处理 → 整张榜全打码
+_QUERY_KEYS = frozenset(('查询', '机挖查询', '生草查询'))
+_FULL_SUFFIXES = ('full', '完整')
 
 # 本插件自用, 不做配置文件: 改名或停用时退回空串, 由中央按模型自动挑接口。
 _PROVIDER_NAME = 'YTea - Pro'
@@ -124,7 +130,13 @@ _JSON_ARR = re.compile(r'\[.*\]', re.DOTALL)
 
 
 def _is_leaderboard_query(user_input):
-    return any(user_input.startswith(prefix) for prefix in _QUERY_PREFIXES)
+    """是否走排行榜分支。镜像 cpp: 先剥 full/完整 后缀 (含剥完残留的空格), 再全等匹配。"""
+    key = user_input
+    for suffix in _FULL_SUFFIXES:
+        if key.endswith(suffix):
+            key = key[:len(key) - len(suffix)].rstrip(' ')
+            break
+    return key in _QUERY_KEYS
 
 
 def _get_service():
