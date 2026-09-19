@@ -4,7 +4,7 @@ __plugin_meta__ = {
     'name': '全量申请',
     'author': 'lengxi',
     'description': '生成群全量消息授权链接，支持记录申请与列表查看',
-    'version': '1.1.0',
+    'version': '1.2.0',
 }
 
 
@@ -72,6 +72,57 @@ _INPUT_TIP = f"1. 请群主点击我的头像\n2. 点击右上角齿轮设置\n3
 _INVALID_GROUP_TIP = "群号过短，请重新输入：\n<qqbot-cmd-input text='全量申请 ' show='全量申请 群号' />"
 
 
+# ── 权限状态 ──
+#   recv_msg_setting == 'all'  ←「获取群内全部消息」
+#   allow_proactive_msg        ←「主动在群聊内发言」
+_PERM_FULL_NAME = '获取群内全部消息'
+_PERM_PUSH_NAME = '主动在群聊内发言'
+
+
+async def _query_perms(event):
+    """拉一次本群的机器人权限 → ``(全量, 主动)``;查不到返回 ``None``。"""
+    gid = str(getattr(event, 'group_id', '') or '')
+    sender = getattr(event, 'sender', None)
+    if not gid or sender is None or not hasattr(sender, 'get_group_bot_state'):
+        return None
+    try:
+        data, _err = await sender.get_group_bot_state(gid, return_error=True)
+    except Exception as e:
+        log.debug(f"查询群 {gid} 权限失败: {e}")
+        return None
+    if not isinstance(data, dict):
+        return None
+    return (data.get('recv_msg_setting') == 'all',
+            bool(data.get('allow_proactive_msg')))
+
+
+def _perm_lines(full, push):
+    mark = lambda on: '✅ 已开启' if on else '❌ 未开启'
+    return (f"> {mark(push)}　{_PERM_PUSH_NAME}\n"
+            f"> {mark(full)}　{_PERM_FULL_NAME}")
+
+
+def _missing_hint(full, push):
+    if not full and not push:
+        return '## 请按下方指引完成授权：'
+    if not push:
+        return f'还差**{_PERM_PUSH_NAME}**：机器人发消息仍受条数限制，需要反复点刷新按钮'
+    return f'还差**{_PERM_FULL_NAME}**'
+
+
+async def _perm_gate(event):
+    """权限闸 → ``(是否已接管, 状态前缀)``。"""
+    perms = await _query_perms(event)
+    if perms is None:
+        return False, ''
+    full, push = perms
+    if full and push:
+        await event.reply(f"<@{event.user_id}>\n当前群权限均已开启\n" + _perm_lines(full, push))
+        return True, ''
+    return False, ('当前群权限状态：\n' + _perm_lines(full, push)
+                   + '\n\n' + _missing_hint(full, push) + '\n\n')
+
+
 def _append_json_record_sync(path, record):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = json.dumps(record, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
@@ -126,13 +177,15 @@ async def _record_apply(event, group_code, status):
 async def apply_full_access(event, match):
     group_code = match.group(1)
     await _record_apply(event, group_code, 'submitted')
-    if event.event_type == 'GROUP_MESSAGE_CREATE':
-        return await event.reply(f"<@{event.user_id}>\n当前群已开启全量消息，无需再次申请")
+    handled, perm_tip = await _perm_gate(event)
+    if handled:
+        return
     bot_uin, bot_uid = _get_bot_uin_uid()
     if not bot_uin or not bot_uid:
         return await event.reply(f"<@{event.user_id}>\n请先在插件配置 data/全量申请_config.json 中填写 uin 和 uid")
     url = _URL_TPL.format(group_code=group_code, bot_uin=bot_uin, bot_uid=bot_uid)
     msg = (
+        perm_tip +
         "## 🔔 全量消息授权\n"
         "群主授权后，机器人可以推送主动消息，*无需再点击刷新按钮*\n"
         f"{_IMG}\n"
@@ -146,17 +199,19 @@ async def apply_full_access(event, match):
 
 @handler(r'^全量申请$', name='全量申请提示', desc='提示输入全量申请群号')
 async def prompt_full_access_group(event, match):
-    if event.event_type == 'GROUP_MESSAGE_CREATE':
-        return await event.reply(f"<@{event.user_id}>\n当前群已开启全量消息，无需再次申请")
-    await event.reply(f"<@{event.user_id}>\n{_INPUT_TIP}")
+    handled, perm_tip = await _perm_gate(event)
+    if handled:
+        return
+    await event.reply(f"<@{event.user_id}>\n{perm_tip}{_INPUT_TIP}")
 
 
 @handler(r'^全量申请\s*(\d{1,5})$', name='全量申请群号校验', desc='提示重新输入疑似错误群号')
 async def reject_short_group_code(event, match):
-    if event.event_type == 'GROUP_MESSAGE_CREATE':
-        return await event.reply(f"<@{event.user_id}>\n当前群已开启全量消息，无需再次申请")
+    handled, perm_tip = await _perm_gate(event)
+    if handled:
+        return
     await _record_apply(event, match.group(1), 'invalid_short')
-    await event.reply(f"<@{event.user_id}>\n{_INVALID_GROUP_TIP}")
+    await event.reply(f"<@{event.user_id}>\n{perm_tip}{_INVALID_GROUP_TIP}")
 
 
 @handler(r'^全量列表$', name='全量列表', desc='列出所有已开启全量消息的群', owner_only=True)
