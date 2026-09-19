@@ -21,13 +21,18 @@ KX_REPLIES = (
 
 
 def _is_full_volume_group(event):
-    """判断是否位于全量群: 全量群的消息事件类型固定为 GROUP_MESSAGE_CREATE"""
+    """判断是否位于全量群: 全量群的消息事件类型固定为 GROUP_MESSAGE_CREATE。
+
+    QQ 仅在群为 bot 开启全量推送后才投递此类型 (普通群 @bot 是
+    GROUP_AT_MESSAGE_CREATE)。直接判断事件类型比查 data.db full_access_groups
+    更实时准确 (群取消全量后立即生效), 且天然属于当前 bot, 无多 bot 混淆。
+    """
     return event.event_type == 'GROUP_MESSAGE_CREATE'
 
 
 @handler(r'^看戏$', name='看戏',
          desc='[仅全量] 随机回复一句催促入局的话',
-         group_only=True)
+         group_only=True, block=True)
 async def kanxi(event, match):
     # 群场景: 仅全量群可触发
     if event.is_group and not _is_full_volume_group(event):

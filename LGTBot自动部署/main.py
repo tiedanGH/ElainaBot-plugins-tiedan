@@ -156,7 +156,7 @@ async def cmd_upload_force(event, match):
 
 @handler(r'^/?upload(?:\s+([\s\S]+))?$', name='LGTBot部署',
          desc='/upload [文件夹名] — 引用群文件上传到 lgtbot (审核通过后落地)',
-         group_only=True, ignore_at_check=True, priority=5)
+         group_only=True, ignore_at_check=True, priority=5, block=True)
 async def cmd_upload(event, match):
     await flow.handle(event, (match.group(1) or '').strip())
 
@@ -165,7 +165,7 @@ async def cmd_upload(event, match):
 # 会被查重拒收。代码真编不过就该改完重新 /upload, flow 会拒绝 (见 handle_recompile)。
 @handler(r'^/?compile(?:\s+([\s\S]+))?$', name='LGTBot重新编译',
          desc='/compile <文件夹名> — 重新编译 (仅上次是临时性编译失败时可用, 无需重传)',
-         group_only=True, ignore_at_check=True, priority=5)
+         group_only=True, ignore_at_check=True, priority=5, block=True)
 async def cmd_recompile(event, match):
     await flow.handle_recompile(event, (match.group(1) or '').strip())
 
