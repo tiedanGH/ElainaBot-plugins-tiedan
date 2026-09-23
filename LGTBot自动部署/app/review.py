@@ -49,6 +49,7 @@ L5 **确定性预扫描** (``scan_injection``): 送审前按高置信特征扫�
 
 from __future__ import annotations
 
+import bisect
 import json
 import re
 import secrets
@@ -327,8 +328,10 @@ def _origin_scan_block(hits: int) -> str:
 #     入参。它们都不是玩家输入, 算进来必然命中, 这个扫描就废了。
 #   · 局部变量与函数返回值同样不做种子: 代码本来就大量发送自己拼的 std::string
 #     (棋盘 HTML、战报、提示文案)。
-#   · 传播 = 任何 `X = …种子…` / `X += …种子…` 都把 X 也算进来, 迭代到不动点。
-#     覆盖「先洗进局部变量或成员变量再发出去」那种形态 (1.9.4 踩过的那类)。
+#   · 传播 = `X = …种子…` / `X += …种子…` / 语句开头的 `X << …种子…` (ostringstream
+#     拼消息) / `X.append(…种子…)` 都把 X 也算进来, 迭代到不动点。覆盖「先洗进局部
+#     变量或成员变量再发出去」那种形态 (1.9.4 踩过的那类)。细节见 _propagation_re /
+#     _blank_non_text_uses / _Instances 各自的说明。
 #   · 覆盖不到的: 种子被当实参传进**另一个函数**、由那边发出去。不做跨函数传播是
 #     刻意的 —— 无类型信息的位置传播会经 char/int 转换污染到 `x`/`i` 这类名字上,
 #     全盘染色后扫描一样废掉。这个缺口在注入给模型的结论里如实交代。
@@ -359,12 +362,18 @@ _MAX_SEND_STMT_LINES = 12        # 一条 << 链再长也就这么多行, 防坏
 
 
 def _send_statements(text: str):
-    """逐条抽出发送语句, 产出 ``(行号, 语句文本)``。
+    """逐条抽出发送语句, 产出 ``(行号, 语句起点偏移, 语句文本)``。
 
     从**发送调用本身**起算而不是整行起算: ``if (!Parse(s, v)) { reply() << "错误"; }``
     这种写法里, ``s`` 出现在同一行但明显不在发送参数里, 从调用处起算才不会误命中。
+    偏移用来确定语句里的变量名指的是哪一个实例 (见 _Instances)。
     """
     lines = text.split('\n')
+    offset = 0
+    starts = []
+    for line in lines:
+        starts.append(offset)
+        offset += len(line) + 1
     for i, line in enumerate(lines):
         m = _SEND_CALL_RE.search(line)
         if not m:
@@ -374,24 +383,127 @@ def _send_statements(text: str):
         while ';' not in stmt and j + 1 < len(lines) and j - i < _MAX_SEND_STMT_LINES:
             j += 1
             stmt += '\n' + lines[j]
-        yield i + 1, stmt
+        yield i + 1, starts[i] + m.start(), stmt
+
+
+# 结果只是 char / int / bool 的方法: 调完文本就没了, 不该往下传
+_NON_TEXT_METHODS = (r'(?:size|length|empty|find|rfind|find_first_of|find_last_of|'
+                     r'compare|starts_with|ends_with|count|contains)')
+
+
+def _word(names) -> str:
+    """污染标识符的匹配式, **排除成员访问** (``.name`` / ``->name`` / ``::name``)。
+
+    1.14.0 没排除, 实测一个种子叫 ``name`` 的包被 ``c->name`` / ``CardInfoOf(x).name``
+    这类「别的对象恰好有个同名字段」染了 43 个标识符、报出 36 处假命中 —— 真回显的那一处反而淹没在里面。
+    """
+    alt = '|'.join(re.escape(n) for n in sorted(names, key=len, reverse=True))
+    return r'(?<!\.)(?<!->)(?<!::)\b(?:' + alt + r')\b'
+
+
+def _blank_non_text_uses(text: str, names) -> str:
+    """把污染标识符「不携带原文」的用法抹成等长空白 (等长保住行号与偏移)。
+
+    下标 ``s[0]`` 得到 char, ``s.size()`` / ``s.find(…)`` 得到数字, ``s == …``
+    得到 bool —— 文本在这一步就没了。不抹的话 ``target = team[arg[0] - '1']``
+    会把 target (一个枚举) 也染上, 后面 ``reply() << Name(target)`` 就成了假命中。
+    ``s.substr(…)`` / ``s.c_str()`` 这类**还带着原文**的方法不在此列, 照常传播 ——
+    只做截断而不限字符集的, 标准里本来就算回显。
+    """
+    if not names:
+        return text
+    w = _word(names)
+    for p in (w + r'\s*\[[^\]\n]*\]',
+              w + r'\s*\.\s*' + _NON_TEXT_METHODS + r'\s*\([^()\n]*\)',
+              w + r'\s*(?:==|!=)',
+              r'(?:==|!=)\s*' + w):
+        text = re.sub(p, lambda m: ' ' * len(m.group(0)), text)
+    return text
+
+
+def _propagation_re(names):
+    """「把污染写进另一个变量」的三种写法, 各捕获一个左值名。
+
+    1.14.0 只认 ``=`` / ``+=``, 漏了 C++ 里拼消息**最常用**的写法 ——
+    ``std::ostringstream oss; oss << … << name; reply() << oss.str();`` ——
+    流插入不是赋值, 于是 oss 没被染上, 这个真回显会被扫成「已排除」, 再作为可信
+    事实告诉模型**不得判 echo**。这是扫描器最不能出的那种错。
+    ``<<`` 的左值必须是**语句开头**的标识符: 否则 ``reply() << x << name`` 会把
+    中间的 x 误当成接收方。
+    """
+    w = _word(names)
+    return re.compile(
+        r'(\w+)\s*\+?=(?!=)[^;]*' + w
+        + r'|(?:^|(?<=[;{}]))[ \t]*(\w+)[ \t]*<<[^;]*' + w
+        + r'|(\w+)\s*\.\s*(?:append|insert|assign|push_back|emplace_back)\s*\([^;]*' + w,
+        re.M)
+
+
+# 同名变量按**声明点**分实例。字符串类局部变量 (auto / std::string / 各种 stringstream)
+# 与字符串形参都算声明点 —— 每个函数里各自 `std::ostringstream oss;` 声明出来的 oss 是
+# 互不相干的变量, 不能因为一个函数里的 oss 被污染, 就把全文件所有 oss.str() 都算成命中。
+# 1.14.x 没分实例, 实测一个真回显连带报出 9 处别的函数的假命中, 上传者照着去给十几处
+# 卡牌名加转义, 全是白干。
+#
+# 故意不做花括号解析: 按声明点切段既不怕 lambda / 初始化列表 / 宏把括号配对搞乱, 出错
+# 的方向也是安全的 —— 漏认一个声明只会让两个变量并成一个实例、多染不少染; 从没被这样
+# 声明过的名字 (成员变量) 天然是全文件一个实例, 跨函数的洗白照样追得到。
+_DECL_RE = re.compile(r'(?:\bauto|\bstd::(?:o|i)?stringstream|\bstd::w?string(?:_view)?)'
+                      r'\s*(?:const\s*)?[&*]{0,2}\s*(\w+)\s*[;=({\[,)]')
+
+
+class _Instances:
+    """name → 该名字在各声明点起算的实例; ``at(name, pos)`` 给出 pos 处指的是哪个。"""
+
+    def __init__(self, content: str):
+        self._decls = {}
+        for m in _DECL_RE.finditer(content):
+            self._decls.setdefault(m.group(1), []).append(m.start(1))
+
+    def at(self, name: str, pos: int) -> tuple:
+        offs = self._decls.get(name)
+        if not offs:
+            return name, -1                      # 从未声明过: 成员 / 全局, 全文件一个实例
+        i = bisect.bisect_right(offs, pos) - 1
+        return name, (offs[i] if i >= 0 else -1)
+
+
+def _taint(content: str):
+    """跑一遍污染传播, 返回 ``(已污染的实例集合, 实例表)``。
+
+    种子 = 指令处理器形参里的字符串参数 (各自是自己那个声明点的实例); 传播见
+    _propagation_re, 左值落在「赋值发生处」的那个实例上。迭代到不动点。
+    """
+    inst = _Instances(content)
+    tainted = set()
+    for m in _HANDLER_PARAMS_RE.finditer(content):
+        for p in _STR_PARAM_RE.finditer(m.group(1)):
+            tainted.add(inst.at(p.group(1), m.start(1) + p.start(1)))
+    for _ in range(_PROPAGATE_ROUNDS):
+        if not tainted:
+            break
+        names = {n for n, _ in tainted}
+        blanked = _blank_non_text_uses(content, names)
+        word = re.compile(_word(names))
+        grown = set(tainted)
+        for m in _propagation_re(names).finditer(blanked):
+            gi = next(i for i in (1, 2, 3) if m.group(i))
+            lhs, lhs_pos = m.group(gi), m.start(gi)
+            rhs_from = m.end(gi)
+            # 右侧确实引用了**被污染的那个实例**才传 —— 同名的另一个实例不算。
+            # finditer 带 pos/endpos 时 start() 仍是整串里的绝对偏移
+            if any(inst.at(w.group(0), w.start()) in tainted
+                   for w in word.finditer(blanked, rhs_from, m.end())):
+                grown.add(inst.at(lhs, lhs_pos))
+        if grown == tainted:
+            break
+        tainted = grown
+    return tainted, inst
 
 
 def _tainted_names(content: str) -> set:
-    """指令处理器的字符串形参 + 由它们赋值出来的变量 (迭代到不动点, 见上方注释)。"""
-    names = set()
-    for params in _HANDLER_PARAMS_RE.findall(content):
-        names.update(_STR_PARAM_RE.findall(params))
-    for _ in range(_PROPAGATE_ROUNDS):
-        if not names:
-            break
-        src = re.compile(r'(\w+)\s*\+?=[^;\n]*\b(?:'
-                         + '|'.join(re.escape(n) for n in names) + r')\b')
-        grown = names | set(src.findall(content))
-        if grown == names:
-            break
-        names = grown
-    return names
+    """被污染的名字 (不分实例), 调试与测试用。"""
+    return {n for n, _ in _taint(content)[0]}
 
 
 def scan_echo_sends(pkg: dict) -> dict:
@@ -415,13 +527,18 @@ def scan_echo_sends(pkg: dict) -> dict:
         if not freetext:
             continue
         content = _blank_compares(raw)
-        cand = _tainted_names(content)
-        names += len(cand)
+        tainted, inst = _taint(content)
+        cand = {n for n, _ in tainted}
+        names += len(tainted)
         if not cand:
             continue
-        word = re.compile(r'\b(?:' + '|'.join(re.escape(n) for n in cand) + r')\b')
-        for lineno, stmt in _send_statements(content):
-            if word.search(stmt):
+        # 发送语句同样只认「携带原文」的用法: reply() << name.size() 不是回显
+        content = _blank_non_text_uses(content, cand)
+        word = re.compile(_word(cand))
+        for lineno, start, stmt in _send_statements(content):
+            # 按实例判: 这条语句里的 oss 是不是**被污染的那个** oss
+            if any(inst.at(w.group(0), start + w.start()) in tainted
+                   for w in word.finditer(stmt)):
                 hits.append((path, lineno))
     return {'files': files, 'names': names, 'hits': hits, 'freetext': freetext}
 
@@ -451,7 +568,8 @@ def _echo_scan_block(scan: dict) -> str:
     return ('【本地预扫描 · 输入回显】系统用确定性规则做过这样一次追踪: 先取出本包 '
             f'{scan["files"]} 个代码文件里**指令处理器**的字符串形参 (签名带 '
             'MsgSenderBase 的那些函数 —— 玩家打进来的字符串只能从这里进来), 再把'
-            '「由它们赋值出来的变量」一并标记, 迭代到不动点, 共 '
+            '「由它们派生出来的变量」一并标记 (赋值、`<<` 流插入、append 都算, 迭代到'
+            '不动点; 同名局部变量按各自的声明分开追踪), 共 '
             f'{scan["names"]} 个标识符; 然后逐条比对每一条发送语句 '
             '(reply / Tell / Boardcast / sender 等)。结果是: '
             '**没有任何一条发送语句里出现过它们中的任何一个**。\n'
