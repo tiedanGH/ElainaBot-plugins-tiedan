@@ -77,7 +77,6 @@ def usage() -> str:
     if required:
         lines.append('🔸压缩包必须包含: ' + '、'.join(required))
     lines.append('🔸rule.md 需有原作标注 (改编需注明「改编自 X」)')
-    lines.append('🔸压缩包不得含以 . 开头的隐藏文件/目录 (.git、.DS_Store 等), 否则直接拒收')
     lines.append('🔸新游戏上传成功后目录自动绑定上传者, 此后仅绑定用户可更新该目录')
     lines.append('🔸审核通过后自动请求编译并回报结果')
     lines.append('🔸内容完全相同的文件会被直接拒收; 只是编译失败请用 /compile 重编')
@@ -167,6 +166,13 @@ async def handle(event, argline: str, force: bool = False) -> bool:
         return False
 
     fname = store.safe_filename(ref.get('filename'))
+    # 隐藏文件与压缩包预检 (archive._reject_hidden) 同一条规则, 只是单文件光看文件名就能判 —— 所以拦在这里, 连下载都省了。
+    # 此前只有文件夹名与压缩包基名过 bad_name,单文件自己的名字没人管, 引用一个 .DS_Store 就能把它写进游戏目录。
+    if fname.startswith('.'):
+        await _send(event, f'❌ 不接受以 . 开头的隐藏文件「{fname}」\n'
+                           '这类文件 (.DS_Store、.gitignore 等) 不应进入游戏目录, '
+                           '请确认引用的是正确的文件')
+        return False
     is_archive = quoted.archive_ext(fname) in quoted.ARCHIVE_EXTS
     if not folder and not is_archive:
         await _send(event, f'❌ 引用的文件「{fname}」不是支持的压缩包\n'
