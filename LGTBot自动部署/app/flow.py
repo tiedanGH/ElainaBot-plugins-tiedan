@@ -77,6 +77,7 @@ def usage() -> str:
     if required:
         lines.append('🔸压缩包必须包含: ' + '、'.join(required))
     lines.append('🔸rule.md 需有原作标注 (改编需注明「改编自 X」)')
+    lines.append('🔸压缩包不得含以 . 开头的隐藏文件/目录 (.git、.DS_Store 等), 否则直接拒收')
     lines.append('🔸新游戏上传成功后目录自动绑定上传者, 此后仅绑定用户可更新该目录')
     lines.append('🔸审核通过后自动请求编译并回报结果')
     lines.append('🔸内容完全相同的文件会被直接拒收; 只是编译失败请用 /compile 重编')
@@ -357,6 +358,14 @@ async def _pipeline(event, cfg: dict, ref: dict, record: dict, target: dict, fol
         store.cleanup_staging(rid)
         try:
             info = await asyncio.to_thread(archive.extract, data, fname, staging, limits)
+        except archive.HiddenMemberError as e:
+            # 必须排在 ArchiveError 之前 (它是子类)。这类不 @ 开发者: 打包时没清干净
+            # 而已, 上传者重打一个就好 —— 不像路径穿越那样需要有人看一眼
+            record.update(stage='hidden', error=str(e))
+            return await _finish_fail(
+                event, cfg, record, '压缩包含隐藏文件, 已拒收', notify=False,
+                suffix='请删掉这些以 . 开头的文件/目录后重新打包上传 '
+                       '(常见的是 .git、.DS_Store、.vscode)')
         except archive.ArchiveError as e:
             record.update(stage='extract', error=str(e))
             return await _finish_fail(event, cfg, record, '压缩包校验失败')
@@ -926,7 +935,8 @@ async def _run_recompile(event, cfg: dict, game: str, last: dict):
 
 _STAGE_TEXT = {
     'received': '未处理完', 'download': '下载失败', 'extract': '解压或校验失败',
-    'integrity': '压缩包不完整', 'review': '审核阶段结束', 'deploy': '部署失败',
+    'integrity': '压缩包不完整', 'hidden': '含隐藏文件被拒',
+    'review': '审核阶段结束', 'deploy': '部署失败',
     'deployed': '已部署', 'duplicate': '重复上传被拒', 'recompile': '重新编译',
     'error': '处理异常', 'cancelled': '任务被取消',
 }

@@ -3,6 +3,8 @@
 解压前逐条校验成员名, 拦截 zip-slip (``../`` / 绝对路径 / 盘符) 与
 tar 里的软链接、设备文件, 并对文件数、解压后总体积设硬上限 —— 上传者是普通
 群成员, 压缩包必须当成不可信输入处理。
+解压前还做一道预检: 包内出现以 ``.`` 开头的隐藏文件/目录 (.git、.DS_Store、
+.vscode 等) 就整包拒收, 一个字节都不落盘 (见 ``_reject_hidden``)。
 
 解压落到 data/staging/<记录号>/, 审核通过后才由 deploy.py 移入正式目录。
 """
@@ -37,6 +39,15 @@ class ArchiveError(Exception):
     """压缩包非法 / 超限 (错误信息可直接回给群里)。"""
 
 
+class HiddenMemberError(ArchiveError):
+    """压缩包里带了以 . 开头的隐藏文件/目录。
+
+    单独分一类是因为**处置方式不同**: 路径穿越、链接成员那些是攻击特征, 要 @ 开发者
+    看一眼; 隐藏文件只是打包时没清干净 (.git/.DS_Store/.vscode 之类), 上传者自己
+    重新打个包就好, 不必惊动开发者。
+    """
+
+
 # ==================== 成员名校验 ====================
 
 def _safe_member_name(name: str) -> str:
@@ -56,6 +67,46 @@ def _safe_member_name(name: str) -> str:
     return '/'.join(parts)
 
 
+_MAX_SHOWN_HIDDEN = 8
+
+
+def hidden_members(names) -> list:
+    """列出以 ``.`` 开头的成员 (任意层级), 去重保序。
+
+    命中后只回传**到那一级为止**的路径: ``.git/objects/ab/cd`` 记成 ``.git``。
+    否则一个 .git 目录能刷出几百条, 提示里根本看不出该删什么。
+    """
+    out = []
+    for raw in names:
+        norm = (raw or '').replace('\\', '/').strip().strip('/')
+        parts = norm.split('/')
+        for i, part in enumerate(parts):
+            if part in ('', '.', '..'):
+                continue
+            if part.startswith('.'):
+                hit = '/'.join(parts[:i + 1])
+                if hit not in out:
+                    out.append(hit)
+                break
+    return out
+
+
+def _reject_hidden(names):
+    """解压**前**的预检: 带隐藏文件就整包拒收, 一个字节都不落盘。
+
+    放在这里而不是 collect 之后, 有两个原因: 一是不该为一个注定被拒的包先写一遍
+    磁盘; 二是 collect 会把 .git / __pycache__ 从遍历里剪掉, 到那一步反而看不见
+    最该拦的东西。macOS 打的 zip 里 ``__MACOSX/._xxx`` 也会被这条带走 —— 目录名
+    本身不以 . 开头, 但里面每个成员都是 ``._`` 开头的。
+    """
+    hits = hidden_members(names)
+    if not hits:
+        return
+    shown = '、'.join(hits[:_MAX_SHOWN_HIDDEN])
+    more = f' 等 {len(hits)} 项' if len(hits) > _MAX_SHOWN_HIDDEN else ''
+    raise HiddenMemberError(f'压缩包内含以 . 开头的隐藏文件/目录: {shown}{more}')
+
+
 # ==================== 解压 ====================
 
 def _extract_zip(data: bytes, dest: str, limits: dict) -> int:
@@ -64,6 +115,7 @@ def _extract_zip(data: bytes, dest: str, limits: dict) -> int:
         infos = zf.infolist()
         if len(infos) > limits['max_files']:
             raise ArchiveError(f'压缩包成员数 {len(infos)} 超过上限 {limits["max_files"]}')
+        _reject_hidden(i.filename for i in infos)
         for info in infos:
             name = _safe_member_name(info.filename)
             if not name:
@@ -87,6 +139,7 @@ def _extract_tar(data: bytes, dest: str, limits: dict) -> int:
         members = tf.getmembers()
         if len(members) > limits['max_files']:
             raise ArchiveError(f'压缩包成员数 {len(members)} 超过上限 {limits["max_files"]}')
+        _reject_hidden(m.name for m in members)
         for m in members:
             name = _safe_member_name(m.name)
             if not name:

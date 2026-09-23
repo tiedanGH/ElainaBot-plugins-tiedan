@@ -49,6 +49,13 @@ sha256, 否则后续记录会漏检这一份内容。
 achievements.h / board.h / icon.png / mygame.cc / option.cmake / options.h /
 rule.md / unittest.cc), 可以多出其他文件, 缺少任一项即拒绝并汇报缺少哪些。
 
+隐藏文件预检 (app/archive.py 的 _reject_hidden, force 同样拒绝): 包内任意层级出现
+以 . 开头的文件或目录 (.git / .DS_Store / .vscode 等) 就整包拒收。检查放在**解压前**
+扫成员名, 一个字节都不落盘 —— 也因为 collect 会把 .git 从遍历里剪掉, 放到那一步反而
+看不见最该拦的东西。报错只列到隐藏那一级 (.git/objects/… 收敛成 .git), 否则一个 .git
+目录能刷出几百条。这类走独立 stage='hidden' 且**不 @ 开发者**: 打包没清干净而已,
+上传者自己重打一个就好, 不像路径穿越那样需要有人看一眼。
+
 自动编译 (app/compile.py): 部署成功后按游戏名请求 LGTBot_ElainaBot 的编译 API,
 超时 (默认 180s) 自动发送取消请求; 编译成功的常规更新只提示上传者已热更新, 并说明
 规则/成就/游戏描述/倍率等属性的修改仍需重启 (完全不 @ 开发者); 编译失败/超时
@@ -128,7 +135,7 @@ __plugin_meta__ = {
     'name': 'LGTBot 自动部署',
     'author': '铁蛋',
     'description': '/upload 引用群文件上传到 lgtbot 目录, 自动内容审核 + 请求编译 + 目录权限管理',
-    'version': '1.14.0',
+    'version': '1.15.0',
 }
 
 log = get_logger(PLUGIN, 'LGTBot自动部署')
