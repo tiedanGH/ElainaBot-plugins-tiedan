@@ -401,7 +401,60 @@ def _word(names) -> str:
     return r'(?<!\.)(?<!->)(?<!::)\b(?:' + alt + r')\b'
 
 
-def _blank_non_text_uses(text: str, names) -> str:
+# 本包里**声明返回标量**的函数 —— 拿玩家输入去调它们, 拿回来的是下标 / 真假 / 枚举,
+# 文本在这一步就没了。1.16.0 不认这个, 实测一个包里 `target = TileByName_(arg)`
+# (声明为 int TileByName_) 把 target 染上, 于是六处 `Boardcast() << TileName_(target)`
+# (从编译期常量表取名) 全成了「可疑点」, 模型把这份清单原样抄成了六条 finding ——
+# 那次误判是扫描器递过去的。
+# 类型信息其实就在文件里: 函数自己的声明写着返回类型。只认得出来的那几种:
+# 内置标量、本文件里声明的 enum, 以及只装着它们的 optional / vector / pair / array / set。
+# 认不出来的 (auto、自定义结构体、指针、框架里的函数) 一律当作可能带文本 —— 宁可多染。
+# **void 不算**: `void SendMsg(const std::string&)` 这类自定义发送函数一旦被抹掉,
+# 发送语句就看不见了, 那是漏报。
+_SCALAR_TYPES = ('int', 'long', 'short', 'bool', 'float', 'double', 'char', 'unsigned',
+                 'signed', 'size_t', 'ssize_t', 'ptrdiff_t', 'int8_t', 'int16_t',
+                 'int32_t', 'int64_t', 'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t')
+_SCALAR_WRAPPERS = ('optional', 'vector', 'pair', 'array', 'set', 'unordered_set', 'tuple')
+_FUNC_DECL_RE = re.compile(
+    r'(?:^|(?<=[;{}]))[ \t]*(?:(?:static|inline|virtual|constexpr|explicit|friend)\s+)*'
+    r'((?:const\s+)?[A-Za-z_][\w:]*(?:\s*<[^;{}()]*>)?)\s*([&*]*)\s+([A-Za-z_]\w*)\s*\(',
+    re.M)
+_ENUM_RE = re.compile(r'\benum\s+(?:class\s+|struct\s+)?([A-Za-z_]\w*)')
+# 查表类方法以污染值为**键**时, 取回的是那个容器里的东西, 不是玩家的原文
+_LOOKUP_METHODS = r'(?:find|at|count|contains|equal_range|lower_bound|upper_bound)'
+
+
+def _is_scalar_type(ret: str, enums: set) -> bool:
+    t = re.sub(r'\b(?:const|volatile)\b', ' ', ret)
+    t = re.sub(r'\bstd::', '', t).strip()
+    m = re.fullmatch(r'(\w+)\s*<(.*)>', t, re.S)
+    if m:
+        if m.group(1) not in _SCALAR_WRAPPERS:
+            return False
+        args = [a.strip() for a in m.group(2).split(',')]
+        return all(a.isdigit() or _is_scalar_type(a, enums) for a in args if a)
+    words = t.split()
+    return bool(words) and all(w in _SCALAR_TYPES or w in enums for w in words)
+
+
+def _non_text_funcs(content: str) -> set:
+    """本文件里声明返回标量 / 本地 enum 的函数名 (见上方注释)。"""
+    enums = set(_ENUM_RE.findall(content))
+    out = set()
+    for m in _FUNC_DECL_RE.finditer(content):
+        ret, ptr, name = m.group(1), m.group(2), m.group(3)
+        if ptr and '*' in ptr:
+            continue                          # 指针可能是 char*, 不冒这个险
+        if name in ('if', 'for', 'while', 'switch', 'return', 'catch', 'sizeof'):
+            continue
+        if _SEND_CALL_RE.match(name + '('):
+            continue                          # 发送函数无论如何不抹
+        if _is_scalar_type(ret, enums):
+            out.add(name)
+    return out
+
+
+def _blank_non_text_uses(text: str, names, funcs=()) -> str:
     """把污染标识符「不携带原文」的用法抹成等长空白 (等长保住行号与偏移)。
 
     下标 ``s[0]`` 得到 char, ``s.size()`` / ``s.find(…)`` 得到数字, ``s == …``
@@ -409,14 +462,23 @@ def _blank_non_text_uses(text: str, names) -> str:
     会把 target (一个枚举) 也染上, 后面 ``reply() << Name(target)`` 就成了假命中。
     ``s.substr(…)`` / ``s.c_str()`` 这类**还带着原文**的方法不在此列, 照常传播 ——
     只做截断而不限字符集的, 标准里本来就算回显。
+
+    ``funcs`` 是本文件里声明返回标量的函数 (见 _non_text_funcs), 对它们的调用整段抹掉;
+    另外 ``m.find(s)`` 这类以污染值为键的查表也抹掉 (取回的是 m 里的东西)。
     """
     if not names:
         return text
     w = _word(names)
-    for p in (w + r'\s*\[[^\]\n]*\]',
-              w + r'\s*\.\s*' + _NON_TEXT_METHODS + r'\s*\([^()\n]*\)',
-              w + r'\s*(?:==|!=)',
-              r'(?:==|!=)\s*' + w):
+    pats = [w + r'\s*\[[^\]\n]*\]',
+            w + r'\s*\.\s*' + _NON_TEXT_METHODS + r'\s*\([^()\n]*\)',
+            w + r'\s*(?:==|!=)',
+            r'(?:==|!=)\s*' + w,
+            r'\.\s*' + _LOOKUP_METHODS + r'\s*\(\s*' + w + r'\s*\)']
+    if funcs:
+        alt = '|'.join(re.escape(f) for f in sorted(funcs, key=len, reverse=True))
+        # 只抹单层括号的调用: 实参里再套括号就认不准了, 不抹 (宁可多染)
+        pats.append(r'\b(?:' + alt + r')\s*\([^()\n]*\)')
+    for p in pats:
         text = re.sub(p, lambda m: ' ' * len(m.group(0)), text)
     return text
 
@@ -430,12 +492,17 @@ def _propagation_re(names):
     事实告诉模型**不得判 echo**。这是扫描器最不能出的那种错。
     ``<<`` 的左值必须是**语句开头**的标识符: 否则 ``reply() << x << name`` 会把
     中间的 x 误当成接收方。
+
+    第四种是 range-for: ``for (const auto& w : words)`` 里 words 被污染 (比如先
+    ``words.push_back(msg)``), 循环变量 w 装的就是玩家原文。1.16.x 不认, 这种写法
+    的真回显会被扫成「已排除」—— 同样是漏报方向。结构化绑定 ``auto& [k, v]`` 暂不认。
     """
     w = _word(names)
     return re.compile(
         r'(\w+)\s*\+?=(?!=)[^;]*' + w
         + r'|(?:^|(?<=[;{}]))[ \t]*(\w+)[ \t]*<<[^;]*' + w
-        + r'|(\w+)\s*\.\s*(?:append|insert|assign|push_back|emplace_back)\s*\([^;]*' + w,
+        + r'|(\w+)\s*\.\s*(?:append|insert|assign|push_back|emplace_back)\s*\([^;]*' + w
+        + r'|\bfor\s*\(\s*(?:const\s+)?[\w:<>]+\s*[&*]*\s*(\w+)\s*:(?!:)[^)]*' + w,
         re.M)
 
 
@@ -448,8 +515,10 @@ def _propagation_re(names):
 # 故意不做花括号解析: 按声明点切段既不怕 lambda / 初始化列表 / 宏把括号配对搞乱, 出错
 # 的方向也是安全的 —— 漏认一个声明只会让两个变量并成一个实例、多染不少染; 从没被这样
 # 声明过的名字 (成员变量) 天然是全文件一个实例, 跨函数的洗白照样追得到。
+# 结尾的 `:(?!:)` 是 range-for 的循环变量 (`for (auto& w : words)`), 让每个循环自己
+# 成一个实例; `::` 是作用域符, 排除
 _DECL_RE = re.compile(r'(?:\bauto|\bstd::(?:o|i)?stringstream|\bstd::w?string(?:_view)?)'
-                      r'\s*(?:const\s*)?[&*]{0,2}\s*(\w+)\s*[;=({\[,)]')
+                      r'\s*(?:const\s*)?[&*]{0,2}\s*(\w+)\s*(?:[;=({\[,)]|:(?!:))')
 
 
 class _Instances:
@@ -468,11 +537,12 @@ class _Instances:
         return name, (offs[i] if i >= 0 else -1)
 
 
-def _taint(content: str):
+def _taint(content: str, funcs=()):
     """跑一遍污染传播, 返回 ``(已污染的实例集合, 实例表)``。
 
     种子 = 指令处理器形参里的字符串参数 (各自是自己那个声明点的实例); 传播见
     _propagation_re, 左值落在「赋值发生处」的那个实例上。迭代到不动点。
+    ``funcs`` 是整包里声明返回标量的函数名 (见 _non_text_funcs)。
     """
     inst = _Instances(content)
     tainted = set()
@@ -483,11 +553,11 @@ def _taint(content: str):
         if not tainted:
             break
         names = {n for n, _ in tainted}
-        blanked = _blank_non_text_uses(content, names)
+        blanked = _blank_non_text_uses(content, names, funcs)
         word = re.compile(_word(names))
         grown = set(tainted)
         for m in _propagation_re(names).finditer(blanked):
-            gi = next(i for i in (1, 2, 3) if m.group(i))
+            gi = next(i for i in (1, 2, 3, 4) if m.group(i))
             lhs, lhs_pos = m.group(gi), m.start(gi)
             rhs_from = m.end(gi)
             # 右侧确实引用了**被污染的那个实例**才传 —— 同名的另一个实例不算。
@@ -503,7 +573,7 @@ def _taint(content: str):
 
 def _tainted_names(content: str) -> set:
     """被污染的名字 (不分实例), 调试与测试用。"""
-    return {n for n, _ in _taint(content)[0]}
+    return {n for n, _ in _taint(content, _non_text_funcs(content))[0]}
 
 
 def scan_echo_sends(pkg: dict) -> dict:
@@ -520,6 +590,10 @@ def scan_echo_sends(pkg: dict) -> dict:
     # 自由文本入口按**整包**判定而不是逐文件: 处理器与它的 checker 注册未必同文件,
     # 按整包看更保守 (宁可照常扫, 不要因为分文件而漏掉种子)
     freetext = any(_FREETEXT_CHECKER_RE.search(c) for _, c in code)
+    # 返回类型表按整包收: 声明常在 board.h 之类的头文件里, 调用却在 mygame.cc
+    funcs = set()
+    for _, c in code:
+        funcs |= _non_text_funcs(c)
     files = names = 0
     hits = []
     for path, raw in code:
@@ -527,13 +601,13 @@ def scan_echo_sends(pkg: dict) -> dict:
         if not freetext:
             continue
         content = _blank_compares(raw)
-        tainted, inst = _taint(content)
+        tainted, inst = _taint(content, funcs)
         cand = {n for n, _ in tainted}
         names += len(tainted)
         if not cand:
             continue
         # 发送语句同样只认「携带原文」的用法: reply() << name.size() 不是回显
-        content = _blank_non_text_uses(content, cand)
+        content = _blank_non_text_uses(content, cand, funcs)
         word = re.compile(_word(cand))
         for lineno, start, stmt in _send_statements(content):
             # 按实例判: 这条语句里的 oss 是不是**被污染的那个** oss
