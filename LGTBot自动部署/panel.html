@@ -537,6 +537,7 @@ async function loadRecords(){
     <td class="mono">${esc(String(rec.elapsed??'-'))}s</td>
     <td style="white-space:nowrap">
       <button class="btn btn-sm" onclick="openRecord('${esc(rec.id)}')">查看</button>
+      ${hasDownload(rec)?`<button class="btn btn-sm" onclick="downloadRecord('${esc(rec.id)}',this)">下载</button>`:''}
       <button class="btn btn-sm btn-soft" onclick="delRecord('${esc(rec.id)}')">删除</button>
     </td>
   </tr>`).join('');
@@ -579,9 +580,53 @@ async function openRecord(id){
     <div class="hint" style="margin-bottom:8px">以下为审核服务的完整回复（群内不输出，仅留档于 data/reviews/）</div>
     <pre class="raw">${esc(r.review_text||'(无留档)')}</pre>
     <div class="actions" style="margin-top:14px">
+      ${hasDownload(rec)?`<button class="btn" onclick="downloadRecord('${esc(id)}',this)">下载留档</button>`:''}
       <button class="btn btn-soft" onclick="delRecord('${esc(id)}',true)">删除这条记录</button>
     </div>`;
   $('modal-mask').classList.add('show');
+}
+/* 下载一条记录的留档：审核留档 md，外加上传原件的留档（上传时开着「留档原压缩包」才有，
+   没有就只下 md）。没走到审核就被拦下的（包不完整、含隐藏文件等）只有原件、没有 md。
+   走 fetch 存成 blob 而不是直接给 <a href>：出错时能提示原因，不会把一段 JSON 错误
+   当成文件存下来。两个文件先后触发，浏览器第一次可能会问是否允许本站下载多个文件。 */
+function hasDownload(rec){return !!(rec&&(rec.review_file||rec.archive_file))}
+function dispositionName(h){
+  const m=/filename\*=UTF-8''([^;]+)/i.exec(h||'');
+  if(m){try{return decodeURIComponent(m[1])}catch(e){}}
+  const f=/filename="([^"]+)"/i.exec(h||'');
+  return f?f[1]:'';
+}
+async function saveDownload(id,kind){
+  let r;
+  try{
+    r=await fetch(API+'/record/download?id='+encodeURIComponent(id)+'&kind='+kind,
+      {headers:{'Authorization':'Bearer '+TOKEN}});
+  }catch(e){return '请求失败: '+(e&&e.message||e)}
+  if(!r.ok){
+    let msg='HTTP '+r.status;
+    try{const j=await r.json();if(j&&j.error)msg=j.error}catch(e){}
+    return msg;
+  }
+  const url=URL.createObjectURL(await r.blob());
+  const a=document.createElement('a');
+  a.href=url;a.download=dispositionName(r.headers.get('Content-Disposition'))||id;
+  document.body.appendChild(a);a.click();a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),30000);
+  return '';
+}
+async function downloadRecord(id,btn){
+  const rec=RECORDS.find(x=>x.id===id)||{};
+  const md=!!rec.review_file,zip=!!rec.archive_file;
+  const text=btn.innerHTML;
+  setBusy(btn,true,text);
+  const errs=[];
+  if(md){const e=await saveDownload(id,'md');if(e)errs.push('审核留档：'+e)}
+  if(zip){const e=await saveDownload(id,'archive');if(e)errs.push('压缩包留档：'+e)}
+  setBusy(btn,false,text);
+  if(errs.length)return toast(errs.join('；'));
+  toast(md&&zip?'已下载审核留档与压缩包留档'
+    :md?'已下载审核留档（这条记录没有压缩包留档）'
+    :'已下载压缩包留档（这条记录没走到审核，没有审核留档）');
 }
 /* 删除单条记录。默认连留档一起删；勾掉则只删索引、留档留在 data/ 里。
    注意：删掉后该内容的 sha256 就查不到了，同一个压缩包可以重新上传 ——

@@ -4,6 +4,9 @@
 注销, 无需手动清理。默认 auth=True: 请求需带后台登录 token。
 """
 
+import os
+from urllib.parse import quote
+
 from aiohttp import web
 
 from core.base.logger import PLUGIN, get_logger
@@ -25,6 +28,7 @@ def register_routes():
     register_route('GET', PREFIX + '/models', _get_models)
     register_route('GET', PREFIX + '/records', _get_records)
     register_route('GET', PREFIX + '/record', _get_record)
+    register_route('GET', PREFIX + '/record/download', _download_record)
     register_route('POST', PREFIX + '/record/delete', _delete_record)
     register_route('POST', PREFIX + '/records/clear', _clear_records)
     register_route('GET', PREFIX + '/perms', _get_perms)
@@ -137,6 +141,29 @@ async def _get_record(request: web.Request):
         return web.json_response({'success': False, 'error': '记录不存在'})
     return web.json_response({'success': True, 'record': record,
                               'review_text': store.get_review_text(rid)})
+
+
+def _attachment(name: str) -> str:
+    """Content-Disposition: 原名走 RFC 5987 的 filename* (压缩包留档常带中文名), 另给一个 ASCII 兜底名。"""
+    fallback = ''.join(c if c.isascii() and (c.isalnum() or c in '-_.') else '_'
+                       for c in name) or 'download'
+    return f'attachment; filename="{fallback}"; filename*=UTF-8\'\'{quote(name, safe="")}'
+
+
+async def _download_record(request: web.Request):
+    """下载一条记录的留档: ``kind=md`` 审核留档, ``kind=archive`` 上传原件的留档。
+
+    只收记录号, 不收路径 (见 store.download_path)。出错回 404 + JSON, 面板据此提示。
+    """
+    full, err = store.download_path(request.query.get('id', ''),
+                                    request.query.get('kind', ''))
+    if err:
+        return web.json_response({'success': False, 'error': err}, status=404)
+    return web.FileResponse(full, headers={
+        'Content-Disposition': _attachment(os.path.basename(full)),
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+    })
 
 
 async def _delete_record(request: web.Request):

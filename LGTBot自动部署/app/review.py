@@ -198,6 +198,9 @@ _CRITERIA = {
              '**判 echo 前必须取证 —— 只给行号不算取证**: 在 reason 里把那一行发送调用的'
              '代码**原样抄下来**, 而且抄出来的那一行里必须**真的出现该自由文本参数的标识符**。'
              '若实参是中间变量, 还要一并抄上把输入写进该变量的那一行赋值。'
+             '若输入是作为实参交给另一个函数、由那个函数发出去的, 就抄两行: 传入它的那一行'
+             '调用 (里面要出现该标识符), 以及那个函数里真正发出它的那一行 (里面要出现接收它'
+             '的形参名)。'
              '「在第 N 行通过 X 发送」这种只报位置不抄代码的写法**不成立**; '
              '抄出来的那行里根本找不到那个标识符的, 同样不成立 —— 说明你记错了行, '
              '此时应当放弃这条 finding, 而不是改口用「存在风险」凑一条。\n'
@@ -332,9 +335,9 @@ def _origin_scan_block(hits: int) -> str:
 #     拼消息) / `X.append(…种子…)` 都把 X 也算进来, 迭代到不动点。覆盖「先洗进局部
 #     变量或成员变量再发出去」那种形态 (1.9.4 踩过的那类)。细节见 _propagation_re /
 #     _blank_non_text_uses / _Instances 各自的说明。
-#   · 覆盖不到的: 种子被当实参传进**另一个函数**、由那边发出去。不做跨函数传播是
-#     刻意的 —— 无类型信息的位置传播会经 char/int 转换污染到 `x`/`i` 这类名字上,
-#     全盘染色后扫描一样废掉。这个缺口在注入给模型的结论里如实交代。
+#   · 种子被当实参交给**另一个函数**、由那边发出去: 先认出哪些自定义函数的哪个字符串
+#     形参会被发出去, 交到那个位置上的调用就算一条发送语句 (见 _find_sinks)。仍覆盖
+#     不到的间接调用 (函数指针 / 回调 / 虚函数) 在注入给模型的结论里如实交代。
 _CODE_EXTS = ('.cc', '.cpp', '.cxx', '.h', '.hpp', '.hh', '.inl')
 # 处理器的参数列表 (不含嵌套括号, 这类签名本来也没有)
 _HANDLER_PARAMS_RE = re.compile(r'\(([^()]*\bMsgSenderBase\b[^()]*)\)')
@@ -506,57 +509,211 @@ def _propagation_re(names):
         re.M)
 
 
-# 同名变量按**声明点**分实例。字符串类局部变量 (auto / std::string / 各种 stringstream)
-# 与字符串形参都算声明点 —— 每个函数里各自 `std::ostringstream oss;` 声明出来的 oss 是
-# 互不相干的变量, 不能因为一个函数里的 oss 被污染, 就把全文件所有 oss.str() 都算成命中。
-# 1.14.x 没分实例, 实测一个真回显连带报出 9 处别的函数的假命中, 上传者照着去给十几处
-# 卡牌名加转义, 全是白干。
+# ==================== 切分函数 ====================
+# 同名变量按所属函数分实例 (_Instances)、跨函数找发送口 (_find_sinks), 都得知道每个函数
+# 从哪到哪: 认出带函数体的定义, 再配它的花括号 —— 配对时跳过字符串 / 字符 / 注释。
+# 配不上时当作一直延伸到文件尾: 函数体取大了, 最坏是多认几个发送口、多报几处; 取小了
+# 才会把真正的发送切到函数外面去 (漏报)。
+# 认不出的写法: 形参表里带括号 (默认实参是函数调用、函数指针形参)、原始字符串字面量
+# 里的花括号。
+_FUNC_HEAD_RE = re.compile(
+    r'\b([A-Za-z_]\w*)\s*\(([^()]*)\)\s*'
+    r'(?:(?:const|noexcept|override|final|mutable)\s*)*'
+    r'(?:->\s*[\w:<>,\s*&]+?)?'
+    r'(?::[^{};]*)?'                       # 构造函数初始化列表
+    r'\{')
+_NOT_FUNCS = frozenset({'if', 'for', 'while', 'switch', 'catch', 'return', 'sizeof',
+                        'do', 'else', 'decltype', 'alignof', 'static_assert'})
+# 形参名 = 默认实参前的最后一个标识符, 且前面得有类型: 光一个 `int` 不算有名字;
+# `::` 后面的是类型的一部分 (`const std::string&` 没有形参名)
+_PARAM_NAME_RE = re.compile(
+    r'\s*\S.*?(?<![\w:])([A-Za-z_]\w*)(?:\s*\[[^\]]*\])*\s*(?:=.*)?$', re.S)
+
+
+def _skip_literal(text: str, i: int) -> int:
+    """i 指在 ``"`` / ``'`` 上, 返回字面量结束处 (闭引号) 的下标。"""
+    q, n = text[i], len(text)
+    i += 1
+    while i < n and text[i] != q:
+        if text[i] == '\\':
+            i += 1
+        elif text[i] == '\n':
+            break                              # 字面量不跨行, 防坏文件一路吃到尾
+        i += 1
+    return i
+
+
+def _match_brace(text: str, open_pos: int) -> int:
+    """从 open_pos 的 ``{`` 配到与之对应的 ``}``, 跳过字符串 / 字符 / 注释。配不上返回文件尾。"""
+    depth, i, n = 0, open_pos, len(text)
+    while i < n:
+        c = text[i]
+        if c in '"\'':
+            i = _skip_literal(text, i)
+        elif text.startswith('//', i):
+            j = text.find('\n', i)
+            i = n if j < 0 else j
+        elif text.startswith('/*', i):
+            j = text.find('*/', i + 2)
+            i = n if j < 0 else j + 1
+        elif c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return n
+
+
+def _split_params(params: str):
+    """形参表按顶层逗号切开 (模板尖括号、字面量里的逗号不切), 产出 ``(起点偏移, 文本)``。"""
+    depth, start, i, n = 0, 0, 0, len(params)
+    while i < n:
+        c = params[i]
+        if c in '"\'':
+            i = _skip_literal(params, i)
+        elif c == '<':
+            depth += 1
+        elif c == '>':
+            depth = max(0, depth - 1)
+        elif c == ',' and depth == 0:
+            yield start, params[start:i]
+            start = i + 1
+        i += 1
+    yield start, params[start:]
+
+
+def _function_heads(content: str) -> list:
+    """带函数体的函数定义 ``[(函数名, 名字偏移, 形参, 体起, 体止)]``。
+
+    形参是 ``[(第几个, 形参名, 名字偏移, 形参文本)]`` —— 没名字的 (``int``、``void``)
+    不列, 但照样占一个位置, 与调用处的实参一一对得上。
+    """
+    out = []
+    for m in _FUNC_HEAD_RE.finditer(content):
+        if m.group(1) in _NOT_FUNCS:
+            continue
+        params = []
+        for idx, (off, text) in enumerate(_split_params(m.group(2))):
+            nm = _PARAM_NAME_RE.match(text)
+            if nm:
+                params.append((idx, nm.group(1), m.start(2) + off + nm.start(1), text))
+        open_pos = m.end() - 1
+        out.append((m.group(1), m.start(1), params, open_pos + 1,
+                    _match_brace(content, open_pos)))
+    return out
+
+
+# ==================== 同名变量分实例 ====================
+# 同名变量按**声明**分成不同的实例, 而且声明只在**所属函数**里有效 —— 每个函数里各自
+# `std::ostringstream oss;` 出来的 oss 互不相干, 不能因为一个函数里的 oss 被污染, 就把
+# 全文件的 oss.str() 都算成命中。1.14.x 没分实例, 实测一个真回显连带报出 9 处别的函数的
+# 假命中, 上传者照着去给十几处卡牌名加转义, 全是白干。
 #
-# 故意不做花括号解析: 按声明点切段既不怕 lambda / 初始化列表 / 宏把括号配对搞乱, 出错
-# 的方向也是安全的 —— 漏认一个声明只会让两个变量并成一个实例、多染不少染; 从没被这样
-# 声明过的名字 (成员变量) 天然是全文件一个实例, 跨函数的洗白照样追得到。
-# 结尾的 `:(?!:)` 是 range-for 的循环变量 (`for (auto& w : words)`), 让每个循环自己
-# 成一个实例; `::` 是作用域符, 排除
+# 认这几种声明:
+#   · 字符串类局部变量: auto / std::string / 各种 stringstream (_DECL_RE)。结尾的 `:(?!:)`
+#     是 range-for 的循环变量 (`for (auto& w : words)`), 让每个循环自己成一个实例
+#   · **函数形参, 不论类型** —— 形参表在语法上毫不含糊。1.16.x 只认字符串形参, 声明又
+#     不限作用域、一路管到下一个同名声明为止, 实测一个包里处理器有 `std::string& target`,
+#     后面别的函数的 `int target`、`PlayerState* target` 形参全被并进了这个被污染的实例,
+#     跨函数追踪一开, 只发角色名的 `RoleName(target->role_id)` 就成了假命中
+#   · 类型确定的局部变量: 内置标量、`std::` 下的类型, 以及本包里声明过的 enum / struct /
+#     class (_typed_decl_re)。只认这几种, 是因为泛泛的「类型名 变量名」分不清 `y * target;`
+#     这种乘法 —— 把乘法误认成声明会把一个被污染的实例切断, 那是漏报
+# 不在任何函数里的声明 (类成员、全局、原型的形参) 不记: 这些名字全文件一个实例, 在一个
+# 函数里被染上、在另一个函数里被发出去照样追得到。漏认一个局部声明, 它就并进这个全文件
+# 的实例 —— 只会多染, 不会少染。
 _DECL_RE = re.compile(r'(?:\bauto|\bstd::(?:o|i)?stringstream|\bstd::w?string(?:_view)?)'
                       r'\s*(?:const\s*)?[&*]{0,2}\s*(\w+)\s*(?:[;=({\[,)]|:(?!:))')
+_TYPE_DEF_RE = re.compile(r'\b(?:struct|class|enum(?:\s+class|\s+struct)?)\s+([A-Za-z_]\w*)')
+# 模板实参允许嵌套一层 (`std::map<std::string, std::vector<int>>`)
+_TMPL_ARGS = r'(?:<(?:[^;{}()<>]|<[^;{}()<>]*>)*>)?'
+
+
+def _typed_decl_re(types):
+    alt = '|'.join(re.escape(t) for t in sorted(types, key=len, reverse=True))
+    return re.compile(
+        r'(?:^|(?<=[;{}(,]))[ \t]*'
+        r'(?:(?:const|static|constexpr|volatile|unsigned|signed|long|short)\s+)*'
+        r'(?:std::\w+|(?:std::)?(?:' + alt + r')\b)\s*' + _TMPL_ARGS
+        + r'\s*(?:const\s*)?[*&]{0,2}\s*([A-Za-z_]\w*)\s*(?=[;=({\[,)]|:(?!:))', re.M)
 
 
 class _Instances:
-    """name → 该名字在各声明点起算的实例; ``at(name, pos)`` 给出 pos 处指的是哪个。"""
+    """name → 该名字的各个实例; ``at(name, pos)`` 给出 pos 处指的是哪个。
 
-    def __init__(self, content: str):
+    实例记作 ``(名字, 声明偏移)``, 全文件的那一个记作 ``(名字, -1)``。
+    ``funcs`` 是顺带切出来的函数 (见 _function_heads), 跨函数追踪接着用。
+    ``types`` 是整包声明过的类型名; 不给就只取本文件的。
+    """
+
+    def __init__(self, content: str, types=None):
+        self.funcs = _function_heads(content)
+        found = {(m.start(1), m.group(1)) for m in _DECL_RE.finditer(content)}
+        for _, _, params, _, _ in self.funcs:
+            found.update((pos, pname) for _, pname, pos, _ in params)
+        types = set(_TYPE_DEF_RE.findall(content) if types is None else types)
+        for m in _typed_decl_re(types | set(_SCALAR_TYPES)).finditer(content):
+            found.add((m.start(1), m.group(1)))
+        # 每个声明归给包住它的最内层函数 (函数名起, 右花括号止), 只在那里面有效
+        regions = sorted((npos, hi) for _, npos, _, _, hi in self.funcs)
+        self._regions = regions
+        self._starts = [lo for lo, _ in regions]
         self._decls = {}
-        for m in _DECL_RE.finditer(content):
-            self._decls.setdefault(m.group(1), []).append(m.start(1))
+        stack, ri = [], 0
+        for pos, name in sorted(found):
+            while ri < len(regions) and regions[ri][0] <= pos:
+                stack.append(regions[ri][1])
+                ri += 1
+            while stack and stack[-1] < pos:
+                stack.pop()
+            if stack:
+                offs, ends = self._decls.setdefault(name, ([], []))
+                offs.append(pos)
+                ends.append(stack[-1])
 
     def at(self, name: str, pos: int) -> tuple:
-        offs = self._decls.get(name)
-        if not offs:
-            return name, -1                      # 从未声明过: 成员 / 全局, 全文件一个实例
-        i = bisect.bisect_right(offs, pos) - 1
-        return name, (offs[i] if i >= 0 else -1)
+        offs, ends = self._decls.get(name, ((), ()))
+        for i in range(bisect.bisect_right(offs, pos) - 1, -1, -1):
+            if pos <= ends[i]:
+                return name, offs[i]
+        return name, -1
+
+    def func_end(self, pos: int) -> int:
+        """包住 pos 的最内层函数的右花括号下标; 不在任何函数里返回 -1。"""
+        for i in range(bisect.bisect_right(self._starts, pos) - 1, -1, -1):
+            if pos <= self._regions[i][1]:
+                return self._regions[i][1]
+        return -1
 
 
-def _taint(content: str, funcs=()):
-    """跑一遍污染传播, 返回 ``(已污染的实例集合, 实例表)``。
+def _blank_range(content: str, names, funcs, lo: int, hi: int) -> str:
+    """只对 [lo, hi) 做 _blank_non_text_uses, 其余原样拼回 (等长, 偏移不变)。
 
-    种子 = 指令处理器形参里的字符串参数 (各自是自己那个声明点的实例); 传播见
-    _propagation_re, 左值落在「赋值发生处」的那个实例上。迭代到不动点。
-    ``funcs`` 是整包里声明返回标量的函数名 (见 _non_text_funcs)。
+    逐个函数体分析时每轮都要抹一次, 整文件抹太慢 —— 一个 3000 行的包有上百个函数。
     """
-    inst = _Instances(content)
-    tainted = set()
-    for m in _HANDLER_PARAMS_RE.finditer(content):
-        for p in _STR_PARAM_RE.finditer(m.group(1)):
-            tainted.add(inst.at(p.group(1), m.start(1) + p.start(1)))
+    if lo <= 0 and hi >= len(content):
+        return _blank_non_text_uses(content, names, funcs)
+    return content[:lo] + _blank_non_text_uses(content[lo:hi], names, funcs) + content[hi:]
+
+
+def _propagate(content: str, inst, seeds, funcs=(), lo: int = 0, hi=None) -> set:
+    """从 ``seeds`` (实例集合) 出发做污染传播, 迭代到不动点, 返回已污染的实例集合。
+
+    只采纳落在 [lo, hi) 里的传播 —— 分析单个函数时就是它的函数体; 处理器级分析传
+    整个文件。传播写法见 _propagation_re, 左值落在「赋值发生处」的那个实例上。
+    """
+    hi = len(content) if hi is None else hi
+    tainted = set(seeds)
     for _ in range(_PROPAGATE_ROUNDS):
         if not tainted:
             break
         names = {n for n, _ in tainted}
-        blanked = _blank_non_text_uses(content, names, funcs)
+        blanked = _blank_range(content, names, funcs, lo, hi)
         word = re.compile(_word(names))
         grown = set(tainted)
-        for m in _propagation_re(names).finditer(blanked):
+        for m in _propagation_re(names).finditer(blanked, lo, hi):
             gi = next(i for i in (1, 2, 3, 4) if m.group(i))
             lhs, lhs_pos = m.group(gi), m.start(gi)
             rhs_from = m.end(gi)
@@ -568,7 +725,34 @@ def _taint(content: str, funcs=()):
         if grown == tainted:
             break
         tainted = grown
-    return tainted, inst
+    return tainted
+
+
+# 只有声明没有函数体的原型: `)` 之后只剩限定符 / `= 0` 就是 `;`
+_PROTO_TAIL_RE = re.compile(r'[\s\w]*(?:=\s*\w+\s*)?;')
+
+
+def _handler_seeds(content: str, inst) -> set:
+    """指令处理器形参里的字符串参数, 各自是自己那个声明的实例。
+
+    原型的形参不是变量, 跳过 —— 它不在任何函数里, 当种子只会落到同名的成员上。
+    """
+    seeds = set()
+    for m in _HANDLER_PARAMS_RE.finditer(content):
+        if _PROTO_TAIL_RE.match(content, m.end()):
+            continue
+        for p in _STR_PARAM_RE.finditer(m.group(1)):
+            seeds.add(inst.at(p.group(1), m.start(1) + p.start(1)))
+    return seeds
+
+
+def _taint(content: str, funcs=()):
+    """处理器级污染传播, 返回 ``(已污染的实例集合, 实例表)``。
+
+    ``funcs`` 是整包里声明返回标量的函数名 (见 _non_text_funcs)。
+    """
+    inst = _Instances(content)
+    return _propagate(content, inst, _handler_seeds(content, inst), funcs), inst
 
 
 def _tainted_names(content: str) -> set:
@@ -576,12 +760,220 @@ def _tainted_names(content: str) -> set:
     return {n for n, _ in _taint(content, _non_text_funcs(content))[0]}
 
 
-def scan_echo_sends(pkg: dict) -> dict:
-    """扫描包内代码: 玩家输入 (或由它派生的变量) 有没有出现在某条发送语句里。
+# ==================== 跨函数: 会把形参发出去的自定义函数 ====================
+# 1.16.x 不追进函数调用, 实测一个真回显就漏在这里: 处理器把玩家原文交给
+# `Main().Log(dn + "：" + content)`, 而 Log 里才 `Broadcast(msg)`。那次扫描器碰巧
+# 还有别处命中, 否则会对一个零校验广播玩家原文的包注入「已被排除, 不得判 echo」。
+#
+# 做法是反过来的: **不**把调用处实参的污染灌进被调函数 —— 早先不做跨函数就是怕这个,
+# 没有类型信息的按位置传播会经 char / int 转换染到 `x`、`i` 这类名字上, 全盘染色后扫描
+# 就废了。而是先对每个自定义函数、每个字符串形参单独问一句: 只看这个形参, 在函数体里
+# 传播下去, 走不走得到发送语句? 走得到的, 这个函数在这个位置上就是一个「发送口」(sink);
+# 处理器里把被污染的实参交到发送口上, 就等同于一条发送语句。sink 可以层层嵌套 (Log 调
+# 自己写的 Send, Send 里才 Tell), 所以整包迭代到不动点。
+# 形参只在函数体里染到了局部变量就只看函数体; 染到了成员 (全文件那个实例), 成员是
+# 共享状态, 就从成员出发在全文件接着追 —— 「先存进成员、别处再发」也是发出去了。
+# 仍然认不出的: 经函数指针 / 回调 / 虚函数间接调用、跨文件的成员、切不出来的函数 (见上方
+# 「切分函数」)。
+_STR_TYPE_RE = re.compile(r'\bstd::w?string(?:_view)?\b')
+_SINK_ROUNDS = 5
 
-    返回 ``{files, names, hits, freetext}``: ``hits`` 是 ``(路径, 行号)`` 列表, 空表示
-    本包内**没有任何一条发送语句提到过玩家输入** —— 回显不成立。``freetext=False``
-    表示整包压根没有自由文本入口 (所有字符串参数都被 checker 限死), 那更是不成立。
+
+def _call_args(text: str, open_paren: int):
+    """从 ``(`` 起切出顶层实参 ``[(起, 止)]``, 跳过字符串; 返回 ``(实参区间, 右括号下标)``。"""
+    depth, i, n = 0, open_paren, len(text)
+    start, args = open_paren + 1, []
+    while i < n:
+        c = text[i]
+        if c in '"\'':
+            i = _skip_literal(text, i)
+        elif c in '([{':
+            depth += 1
+        elif c in ')]}':
+            depth -= 1
+            if depth == 0:
+                if text[start:i].strip():
+                    args.append((start, i))
+                return args, i
+        elif c == ',' and depth == 1:
+            args.append((start, i))
+            start = i + 1
+        i += 1
+    return args, n
+
+
+def _sink_calls(content: str, sinks: dict, heads: set, lo: int = 0, hi=None):
+    """[lo, hi) 里对 sink 函数的调用, 产出 ``(调用起点, [(实参起, 实参止), …])``
+    —— 只给出落在 sink 位置上的那几个实参。``heads`` 是函数定义处的名字偏移, 跳过。"""
+    if not sinks:
+        return
+    hi = len(content) if hi is None else hi
+    alt = '|'.join(re.escape(s) for s in sorted(sinks, key=len, reverse=True))
+    for m in re.compile(r'\b(' + alt + r')\s*\(').finditer(content, lo, hi):
+        if m.start(1) in heads:
+            continue
+        args, _ = _call_args(content, m.end() - 1)
+        picked = [args[j] for j in sinks[m.group(1)] if j < len(args)]
+        if picked:
+            yield m.start(), picked
+
+
+def _refs_tainted(text: str, base: int, tainted, inst, word) -> bool:
+    """text (起点在整串的 base 处) 里有没有引用**被污染的那个实例**。"""
+    return any(inst.at(w.group(0), base + w.start()) in tainted for w in word.finditer(text))
+
+
+def _tainted_refs(text: str, base: int, tainted, inst, word) -> set:
+    """text 里引用到的污染实例 (同 _refs_tainted, 但要全集 —— 判闸门要逐个看)。"""
+    return {inst.at(w.group(0), base + w.start()) for w in word.finditer(text)} & tainted
+
+
+def _reaches_send(content: str, inst, tainted, funcs, sinks, heads, sends,
+                  lo: int, hi: int) -> bool:
+    """[lo, hi) 里有没有一条发送语句、或一次交给 sink 的调用, 带着被污染的实例。
+
+    发送语句只认「携带原文」的用法 (``reply() << s.size()`` 不算)。找 sink 调用时
+    **不抹**返回标量的 sink —— ``bool Say(const std::string&)`` 这种会发送的函数
+    一旦被当成「调用结果不带文本」抹掉, 调用它的那一处就看不见了。
+    """
+    names = {n for n, _ in tainted}
+    word = re.compile(_word(names))
+    for _, start, stmt in sends:
+        if lo <= start < hi and _refs_tainted(
+                _blank_non_text_uses(stmt, names, funcs), start, tainted, inst, word):
+            return True
+    blanked = _blank_range(content, names, set(funcs) - set(sinks), lo, hi)
+    return any(_refs_tainted(blanked[a:b], a, tainted, inst, word)
+               for _, picked in _sink_calls(blanked, sinks, heads, lo, hi)
+               for a, b in picked)
+
+
+def _find_sinks(files: list, funcs) -> dict:
+    """整包迭代到不动点: ``{函数名: {会被发出去的字符串形参位置}}`` (见上方注释)。
+
+    ``files`` 是 ``[(路径, 内容, 实例表)]``。同名重载的 sink 位置合并 (宁可多报)。
+    """
+    prepared = []
+    for _, content, inst in files:
+        fns = []
+        for name, _, params, lo, hi in inst.funcs:
+            ps = [(idx, pname, ppos) for idx, pname, ppos, text in params
+                  if _STR_TYPE_RE.search(text)]
+            if ps:
+                fns.append((name, ps, lo, hi))
+        heads = {npos for _, npos, _, _, _ in inst.funcs}
+        prepared.append((content, inst, fns, heads, list(_send_statements(content))))
+    sinks = {}
+    for _ in range(_SINK_ROUNDS):
+        changed = False
+        for content, inst, fns, heads, sends in prepared:
+            for name, params, lo, hi in fns:
+                for idx, pname, ppos in params:
+                    if idx in sinks.get(name, ()):
+                        continue
+                    inner = _propagate(content, inst, {inst.at(pname, ppos)}, funcs, lo, hi)
+                    hit = _reaches_send(content, inst, inner, funcs, sinks, heads, sends, lo, hi)
+                    members = {t for t in inner if t[1] == -1}
+                    if not hit and members:
+                        outer = _propagate(content, inst, members, funcs)
+                        hit = _reaches_send(content, inst, outer, funcs, sinks, heads, sends,
+                                            0, len(content))
+                    if hit:
+                        sinks.setdefault(name, set()).add(idx)
+                        changed = True
+        if not changed:
+            break
+    return sinks
+
+
+# ==================== 校验闸门 ====================
+# 「先白名单校验、再发送」是正确写法: `if (!Validate(x)) { reply() << "格式不对"; return …; }`
+# 之后再把 x 发出去, 取值已经被限死了。跨函数追踪一开, 实测一个修好了的包就被报出
+# 三处这样的「可疑点」。
+# 但扫描器**判断不了校验够不够严**: 另一个包的闸门长得一模一样, 只是校验里的模板带
+# `.+` 通配, 任意文字照样放行 —— 那是真回显。把闸门当成「已净化」, 这种包就会被扫成
+# 「已排除」、再以可信事实告诉模型不得判 echo, 正是这个扫描器最不能出的错。
+# 所以闸门后面的发送**单列**成 gated: 不进可疑点清单, 也不算排除, 注入时把判断标准交给
+# 模型 —— 让它去看那个校验函数本身 (见 _echo_scan_block)。
+# 认的闸门: 本包声明返回 bool、自己不发送的函数, 条件**恰好**是对它的一次调用, 实参里
+# 带着污染实例。取反的 (`if (!F(x)) …`) 要求 if 体里 return / throw, 之后到函数结束的
+# 发送算已校验; 不取反的 (`if (F(x)) { … }`) 只有 if 体里算。一条发送里引用的污染实例
+# 全都被闸门挡过才算 gated, 有一个没挡就照常是可疑点。
+_IF_RE = re.compile(r'\bif\s*\(')
+# `!F(…)` / `F(…)`, 前面可以带对象访问 (`Main().F(…)`、`this->F(…)`)
+_GATE_COND_RE = re.compile(r'\s*(!?)\s*(?:[\w:]+\s*(?:\(\s*\))?\s*(?:\.|->)\s*)*([A-Za-z_]\w*)\s*\(')
+_EXIT_RE = re.compile(r'\breturn\b|\bthrow\b')
+
+
+def _bool_funcs(content: str) -> set:
+    """本文件里声明返回 bool 的函数名 —— 校验闸门的候选。"""
+    out = set()
+    for m in _FUNC_DECL_RE.finditer(content):
+        ret = re.sub(r'\b(?:const|volatile)\b', ' ', m.group(1)).strip()
+        if ret == 'bool' and not m.group(2) and m.group(3) not in _NOT_FUNCS:
+            out.add(m.group(3))
+    return out
+
+
+def _stmt_end(text: str, i: int) -> int:
+    """从 i 起到语句结尾的 ``;`` (跳过字面量); 没有就到文件尾。"""
+    n = len(text)
+    while i < n:
+        if text[i] in '"\'':
+            i = _skip_literal(text, i)
+        elif text[i] == ';':
+            return i
+        i += 1
+    return n
+
+
+def _gates(content: str, inst, gate_funcs, tainted, word) -> list:
+    """找出校验闸门, 产出 ``[(挡住的污染实例, 起, 止)]`` —— 发送落在 (起, 止] 里才算被挡过。"""
+    out = []
+    if not gate_funcs:
+        return out
+    for m in _IF_RE.finditer(content):
+        open_paren = m.end() - 1
+        _, close = _call_args(content, open_paren)
+        cm = _GATE_COND_RE.match(content, open_paren + 1, close)
+        if not cm or cm.group(2) not in gate_funcs:
+            continue
+        call_open = cm.end() - 1
+        _, call_close = _call_args(content, call_open)
+        if content[call_close + 1:close].strip():
+            continue                                   # 条件里还有别的 (`&&` / `||`), 不认
+        covered = {inst.at(w.group(0), w.start())
+                   for w in word.finditer(content, call_open, call_close)} & tainted
+        if not covered:
+            continue
+        i = close + 1
+        while i < len(content) and content[i] in ' \t\r\n':
+            i += 1
+        body_lo = i
+        body_hi = _match_brace(content, i) if content.startswith('{', i) else _stmt_end(content, i)
+        if cm.group(1):
+            end = inst.func_end(m.start())
+            if end >= 0 and _EXIT_RE.search(content, body_lo, body_hi):
+                out.append((covered, body_hi, end))
+        else:
+            out.append((covered, body_lo, body_hi))
+    return out
+
+
+def _gated(pos: int, refs: set, gates: list) -> bool:
+    """pos 处这条发送引用的污染实例 refs 是不是**全都**被闸门挡过。"""
+    return bool(refs) and all(any(r in cov and lo < pos <= hi for cov, lo, hi in gates)
+                              for r in refs)
+
+
+def scan_echo_sends(pkg: dict) -> dict:
+    """扫描包内代码: 玩家输入 (或由它派生的变量) 有没有被发出去。
+
+    返回 ``{files, names, hits, gated, freetext, sinks}``: ``hits`` 是 ``(路径, 行号)``
+    列表 —— 发送语句, 或把污染实参交给 sink 的调用。``gated`` 是其中先过了校验闸门的
+    那些, 单列 (见上方「校验闸门」)。两者都空表示本包内**没有任何一处把玩家输入发出去**
+    —— 回显不成立。``freetext=False`` 表示整包压根没有自由文本入口 (所有字符串参数都被
+    checker 限死), 那更是不成立。``sinks`` 是认出来的发送口, 调试用。
     """
     code = [(str(t.get('path') or ''), t.get('content') or '')
             for t in pkg.get('texts') or []
@@ -590,31 +982,65 @@ def scan_echo_sends(pkg: dict) -> dict:
     # 自由文本入口按**整包**判定而不是逐文件: 处理器与它的 checker 注册未必同文件,
     # 按整包看更保守 (宁可照常扫, 不要因为分文件而漏掉种子)
     freetext = any(_FREETEXT_CHECKER_RE.search(c) for _, c in code)
-    # 返回类型表按整包收: 声明常在 board.h 之类的头文件里, 调用却在 mygame.cc
-    funcs = set()
+    # 返回类型表、类型名、sink 表都按整包收: 声明常在 board.h 之类的头文件里, 用却在 mygame.cc
+    funcs, types, bools = set(), set(), set()
     for _, c in code:
         funcs |= _non_text_funcs(c)
-    files = names = 0
-    hits = []
-    for path, raw in code:
-        files += 1
-        if not freetext:
-            continue
-        content = _blank_compares(raw)
-        tainted, inst = _taint(content, funcs)
-        cand = {n for n, _ in tainted}
+        types.update(_TYPE_DEF_RE.findall(c))
+        bools |= _bool_funcs(c)
+    files = []
+    if freetext:
+        for path, raw in code:
+            content = _blank_compares(raw)
+            files.append((path, content, _Instances(content, types)))
+    sinks = _find_sinks(files, funcs)
+    live = funcs - set(sinks)
+    gate_funcs = bools - set(sinks)            # 自己就会发送的不是闸门, 调它本身就是一次发送
+    names = 0
+    hits, gated = set(), set()
+    for path, content, inst in files:
+        tainted = _propagate(content, inst, _handler_seeds(content, inst), funcs)
         names += len(tainted)
+        cand = {n for n, _ in tainted}
         if not cand:
             continue
-        # 发送语句同样只认「携带原文」的用法: reply() << name.size() 不是回显
-        content = _blank_non_text_uses(content, cand, funcs)
         word = re.compile(_word(cand))
-        for lineno, start, stmt in _send_statements(content):
+        # 闸门在抹之前的文本上找: 校验函数返回 bool, 抹完就看不见了
+        gates = _gates(content, inst, gate_funcs, tainted, word)
+
+        def put(pos, refs, lineno):
+            if refs:
+                (gated if _gated(pos, refs, gates) else hits).add((path, lineno))
+
+        # 发送语句同样只认「携带原文」的用法: reply() << name.size() 不是回显
+        blanked = _blank_non_text_uses(content, cand, live)
+        for lineno, start, stmt in _send_statements(blanked):
             # 按实例判: 这条语句里的 oss 是不是**被污染的那个** oss
-            if any(inst.at(w.group(0), start + w.start()) in tainted
-                   for w in word.finditer(stmt)):
-                hits.append((path, lineno))
-    return {'files': files, 'names': names, 'hits': hits, 'freetext': freetext}
+            put(start, _tainted_refs(stmt, start, tainted, inst, word), lineno)
+        # 把被污染的实参交给「会把它发出去」的自定义函数, 等同一条发送语句
+        heads = {npos for _, npos, _, _, _ in inst.funcs}
+        for call_pos, picked in _sink_calls(blanked, sinks, heads):
+            refs = set()
+            for a, b in picked:
+                refs |= _tainted_refs(blanked[a:b], a, tainted, inst, word)
+            put(call_pos, refs, blanked.count('\n', 0, call_pos) + 1)
+    return {'files': len(code), 'names': names, 'hits': sorted(hits),
+            'gated': sorted(gated - hits), 'freetext': freetext,
+            'sinks': {k: sorted(v) for k, v in sorted(sinks.items())}}
+
+
+# 闸门后面的发送怎么判: 扫描器判断不了, 把标准原样交给模型 (见「校验闸门」)
+_GATE_RULE = ('扫描器**不评估校验够不够严**, 这由你看那个校验函数本身来判断: 它只放行固定选项、'
+              '数字这类受限取值, 而且是整串匹配的, 就属于「校验成受限取值后再输出」, **不是** echo, '
+              '这几处不要报; 校验里只要有一条能放行任意文字的分支 (如 `.+`、`.*` 这类通配, 或只看'
+              '长度就放行的兜底), 才判 echo, 并且 reason 里必须原样抄出那条放行分支 —— 抄不出来,'
+              '就不能以「校验可能不够严」为由判 echo。')
+
+
+def _locs(items) -> str:
+    """``[(路径, 行号)]`` → 「a.cc:3, a.cc:9 等 12 处」(最多列 8 个)。"""
+    loc = ', '.join(f'{p}:{n}' for p, n in items[:8])
+    return loc + (f' 等 {len(items)} 处' if len(items) > 8 else '')
 
 
 def _echo_scan_block(scan: dict) -> str:
@@ -622,13 +1048,19 @@ def _echo_scan_block(scan: dict) -> str:
     if not scan or not scan.get('files'):
         return ''
     hits = scan.get('hits') or []
+    gated = scan.get('gated') or []
+    gate_note = ''
+    if gated:
+        gate_note = (f'另有 {len(gated)} 处是先过了校验才发送的 (发送之前, 同一个函数里已经有一道 '
+                     '`if (!校验函数(…)) { …; return …; }` 把它挡过): '
+                     f'{_locs(gated)}。' + _GATE_RULE)
     if hits:
-        loc = ', '.join(f'{p}:{n}' for p, n in hits[:8])
-        more = f' 等 {len(hits)} 处' if len(hits) > 8 else ''
         return ('【本地预扫描 · 输入回显】系统用确定性规则追踪了字符串形参及其派生变量, '
-                f'发现这些位置的发送语句里出现了它们: {loc}{more}。这只是**可疑点清单, '
-                '不是结论** —— 同名变量、经解析后重建的值都可能命中。请照标准逐条核对, '
-                '判定以你读到的代码为准。')
+                f'发现这些位置出现了它们: {_locs(hits)} —— 可能是发送语句本身, 也可能是把它们'
+                '交给了「函数里会把这个参数发出去」的自定义函数的调用 (这种要跟进那个函数里'
+                '核对)。这只是**可疑点清单, 不是结论** —— 同名变量、经解析后重建的值都可能'
+                '命中。请照标准逐条核对, 判定以你读到的代码为准。'
+                + ('\n' + gate_note if gate_note else ''))
     if not scan.get('freetext'):
         return ('【本地预扫描 · 输入回显】系统用确定性规则扫过本包全部 '
                 f'{scan["files"]} 个代码文件的指令注册, **没有找到任何自由文本入口**: '
@@ -639,20 +1071,27 @@ def _echo_scan_block(scan: dict) -> str:
                 '哪怕某个参数声明成了 `std::string`, 只要它的 checker 是 '
                 '`AlterChecker<std::string>` 之类, 取值就只有映射表里那几个词, '
                 '发出去也不构成回显。')
-    return ('【本地预扫描 · 输入回显】系统用确定性规则做过这样一次追踪: 先取出本包 '
-            f'{scan["files"]} 个代码文件里**指令处理器**的字符串形参 (签名带 '
-            'MsgSenderBase 的那些函数 —— 玩家打进来的字符串只能从这里进来), 再把'
-            '「由它们派生出来的变量」一并标记 (赋值、`<<` 流插入、append 都算, 迭代到'
-            '不动点; 同名局部变量按各自的声明分开追踪), 共 '
-            f'{scan["names"]} 个标识符; 然后逐条比对每一条发送语句 '
-            '(reply / Tell / Boardcast / sender 等)。结果是: '
-            '**没有任何一条发送语句里出现过它们中的任何一个**。\n'
+    traced = ('【本地预扫描 · 输入回显】系统用确定性规则做过这样一次追踪: 先取出本包 '
+              f'{scan["files"]} 个代码文件里**指令处理器**的字符串形参 (签名带 '
+              'MsgSenderBase 的那些函数 —— 玩家打进来的字符串只能从这里进来), 再把'
+              '「由它们派生出来的变量」一并标记 (赋值、`<<` 流插入、append 都算, 迭代到'
+              '不动点; 同名变量按各自所在的函数分开追踪), 共 '
+              f'{scan["names"]} 个标识符; 然后逐条比对每一条发送语句 '
+              '(reply / Tell / Boardcast / sender 等), 以及每一处把它们当实参交给自定义'
+              '函数的调用 —— 那个函数 (连同它再调用的函数) 会不会把这个参数发出去, 也逐层'
+              '追过。')
+    if gated:
+        # 不写「已被排除」: 闸门够不够严扫描器判断不了, 那几处的结论交给模型
+        return (traced + '结果是: **没有任何一处未经校验就把它们发出去**。' + gate_note + '\n'
+                '除此之外, 你**不得**以「参数是 AnyArg / 自由文本」「若被拼接则构成回显」'
+                '「存在注入风险」为由判 echo: 这些说的都是可能性, 而本条只处罚**已经发生**的回显。')
+    return (traced + '结果是: **没有任何一处把它们中的任何一个发出去**。\n'
             '这是客观事实 —— 本包的输入回显**已被排除**。你**不得**以「参数是 AnyArg / '
             '自由文本」「未做字符集限制」「若被拼接则构成回显」「存在注入风险」为由判 '
             'echo: 这些说的都是可能性, 而本条只处罚**已经发生**的回显。\n'
-            '扫描覆盖不到的只剩一种情形: 玩家输入被当实参传进**另一个函数**, 由那边'
-            '发出去。要判这种, 必须在 reason 里**同时**原样引用「把输入传进去的那一行'
-            '调用」与「那个函数里真正发出它的那一行」。两样都引用不出就不能判 echo。')
+            '扫描覆盖不到的只剩间接的交出: 经函数指针、回调、虚函数把输入交给别处, 由那边'
+            '发出去。要判这种, 必须在 reason 里**同时**原样引用「把输入交出去的那一行」'
+            '与「真正把它发出去的那一行」。两样都引用不出就不能判 echo。')
 
 
 def criteria_keys(mode: str, echo: bool = True) -> tuple:

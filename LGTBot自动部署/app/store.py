@@ -232,6 +232,35 @@ def get_review_text(rid: str) -> str:
         return ''
 
 
+def download_path(rid: str, kind: str) -> tuple[str | None, str]:
+    """面板下载: 某条记录的审核留档 (``kind='md'``) 或上传原件的留档 (``kind='archive'``)。
+
+    只按记录号取、只认记录里登记的路径 (md 另有 reviews/<记录号>.md 兜底, 与
+    delete_record 同一口径), 而且必须落在对应的留档目录里 —— 这个接口不接受任何
+    路径参数, 也就没有拿它读 data/ 下别的文件 (配置、权限表) 的余地。
+    返回 ``(绝对路径, 错误)``。
+    """
+    rec = get_record(str(rid or '').strip())
+    if rec is None:
+        return None, '记录不存在'
+    if kind == 'md':
+        root = REVIEWS_DIR
+        full = resolve(str(rec.get('review_file') or '')) \
+            or os.path.join(REVIEWS_DIR, f'{rec.get("id")}.md')
+    elif kind == 'archive':
+        root = ARCHIVES_DIR
+        full = resolve(str(rec.get('archive_file') or ''))
+        if not full:
+            return None, '这条记录没有压缩包留档 (上传时未开启留档)'
+    else:
+        return None, '未知的下载类型'
+    root = os.path.realpath(root)
+    full = os.path.realpath(full)
+    if not full.startswith(root + os.sep) or not os.path.isfile(full):
+        return None, '留档文件不存在 (可能已在「数据文件」页删除)'
+    return full, ''
+
+
 def append_review_text(rid: str, text: str):
     """向已有留档追加一段 (编译结果等后到的信息)。"""
     path = os.path.join(REVIEWS_DIR, f'{rid}.md')
