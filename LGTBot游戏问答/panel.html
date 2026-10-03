@@ -163,10 +163,11 @@ td code{font-size:11px;color:var(--text3)}
     <div class="row"><input type="checkbox" id="moderation_fail_closed"><span>审核不可用时也阻断<b>输入</b></span></div>
     <p class="hint"><b>输出审核永远 fail-closed</b>：审核不可用一律不发，不受上面这个开关影响。发出去的每个字都算机器人自己说的，而回答素材来自玩家上传的游戏源码，不能在审核失灵时裸奔。</p>
     <div class="grid" style="margin-top:10px">
-      <div><label>违规词黑名单（逗号分隔，确定性拦截）</label><input type="text" id="blocked_words"></div>
-      <div><label>命中违规词的回复</label><input type="text" id="blocked_response"></div>
-      <div><label>未通过审核的回复</label><input type="text" id="moderation_blocked_response"></div>
+      <div><label>违规词黑名单（逗号分隔，只过滤 AI 回答）</label><input type="text" id="blocked_words"></div>
+      <div><label><b>入口</b>话术：用户提问没过审</label><input type="text" id="moderation_blocked_response"></div>
+      <div><label><b>出口</b>话术：AI 回答没发出去</label><input type="text" id="blocked_response"></div>
     </div>
+    <p class="hint"><b>入口</b>话术：用户提问被审核拦下时，机器人回复给用户的提示。<br><b>出口</b>话术：AI 回答被审核拦下时，机器人回复给用户的提示。</p>
     <label style="margin-top:12px">审核提示词</label>
     <textarea id="safety_review_prompt" style="min-height:120px"></textarea>
     <p class="hint">审核模型只允许返回「安全」或「内容违规，已禁止发送」，返回其他内容一律视为审核不可用。游戏规则天然含「杀」「攻击」「血量」等词，可能被判违规——宁可误伤也不放行是刻意取舍，确有需要就调这段提示词，<b>不要整条关掉</b>。<br><b>清空这个框再保存 = 恢复默认审核提示词</b>（与 AI 聊天陪伴同口径）。删空了也不会让审核裸奔：保存与加载时都会自动补回默认值。</p>

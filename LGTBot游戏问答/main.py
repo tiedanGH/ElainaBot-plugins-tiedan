@@ -38,7 +38,7 @@ __plugin_meta__ = {
     'name': 'LGTBot 游戏问答',
     'author': '铁蛋',
     'description': '@机器人提问 LGTBot 游戏规则与结算，AI 现场检索源码后作答',
-    'version': '1.10.2',
+    'version': '1.10.3',
     'license': 'MIT',
 }
 
@@ -1114,7 +1114,8 @@ async def _answer(event, question: str) -> None:
         if hit_word:
             log.warning('AI 输出命中违规词，已替换为安全回复')
         elif await _output_rejected(current, answer):
-            answer = str(current.get('moderation_blocked_response') or '')
+            # 用**出口**话术，不是入口那句「请换一种安全、合规的表达」。
+            answer = str(current.get('blocked_response') or '')
             blocked = True
         if blocked:
             await _bump('blocked_output')

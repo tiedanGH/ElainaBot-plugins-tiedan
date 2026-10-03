@@ -201,9 +201,13 @@ DEFAULT_CONFIG = {
     'moderation_enabled': True,
     'moderation_fail_closed': False,
     'safety_review_prompt': DEFAULT_SAFETY_REVIEW_PROMPT,
-    'moderation_blocked_response': '这条消息未通过内容安全检查，请换一种安全、合规的表达。',
+
+    # 入口：**用户的提问**没过审。让他换个说法是对的，问题确实出在那句话上。
+    'moderation_blocked_response': '您的提问未通过内容安全检查，请换一种安全、合规的表达。',
+
+    # 出口：**AI 自己的回答**没能发出去（命中违规词 / 模型复审不通过 / 审核不可用）。
     'blocked_words': [],
-    'blocked_response': '这个内容不适合继续讨论，请换个内容询问。',
+    'blocked_response': '这个问题我暂时无法回答，生成的内容未通过安全检查。请尝试换个问法，或者问点别的。',
 
     # ---- 提示词 ----
     'system_prompt': DEFAULT_SYSTEM_PROMPT,
