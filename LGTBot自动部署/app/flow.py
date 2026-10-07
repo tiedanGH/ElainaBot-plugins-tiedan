@@ -6,7 +6,7 @@
     /upload force [文件夹名]    仅主人: 跳过内容审核与查重直传 (force 可简写 f)
     /upload help               查看指令帮助
 
-同名目录 / 同名文件一律直接替换 (旧内容按配置备份到 data/backups)。
+同名目录 / 同名文件一律直接替换 (旧内容先挪进 data/backups, 编译没过就放回去)。
 
 force 跳过两样: **内容审核**与 **sha256 查重**。前者是它的本意; 后者因为查重是替
 普通上传者省一轮无谓的审核, 而主人重传同一个包往往正是想要的 (服务器侧出过状况需要
@@ -28,6 +28,11 @@ force 由主人本人发起, 完成后不再 @ 通知部署人员。
   · 新游戏编译成功后自动请求 LGTBot 计划重启 (自动模式, 维护原因「新游戏《X》」),
     请求成功即不再 @ 开发者 —— 对局清空后由 LGTBot 自行重启, 本插件不跟踪;
     只有请求失败才 @ 开发者手动安排。老游戏更新走热更新, 不请求重启也不 @ 开发者。
+  · 编译没成就把 games/ 恢复成部署前的样子 (见 _settle): LGTBot 的 CMake 会扫 games/
+    下所有带 mygame.cc 的目录, 留一份编不过的代码在那里, 谁下次做完整编译都会卡在它
+    身上。老游戏放回上一版本; 新游戏整个目录移除 (连同自动加的绑定), 下次上传照旧按
+    新游戏走。临时性失败也照样恢复原状, 只是新代码先挪进 data/pending/, /compile 时
+    换回去再编。
 """
 
 from __future__ import annotations
@@ -189,7 +194,11 @@ async def handle(event, argline: str, force: bool = False) -> bool:
     # 未通过权限校验的请求直接拒绝, **不进入审核流程**。
     game = folder if folder else deploy.strip_archive_ext(fname)
     exists = os.path.isdir(os.path.join(target['path'], game))
-    if exists and not force:
+    # 新游戏编译临时失败时目录会被暂时撤下、新代码在 data/pending 等 /compile ——
+    # 这段时间目录不在, 但名字仍归那位上传者 (绑定留着), 照样只许绑定用户来传,
+    # 否则别人抢先传一个同名新游戏, 那份暂存就被顶掉了
+    held = not exists and bool(store.pending_of(store.last_game_record(game)))
+    if (exists or held) and not force:
         owner = store.perm_get(game)
         if owner is None:
             await _send(event, f'❌ 权限不足: 目录「{game}」尚未绑定更新权限\n'
@@ -694,10 +703,17 @@ async def _finish_deploy(event, cfg: dict, record: dict, data: bytes, staging: s
         return await _send(event, '\n'.join(lines))
 
     record.update(stage='deployed', dest=res['dest'], deploy_name=res['name'],
-                  backup=res['backup'])
+                  backup=res['backup'], replaced=res['replaced'],
+                  backup_temp=res['backup_temp'])
     game = folder if folder else res['name']
+    # 同一游戏上一条记录若还有一份等 /compile 的暂存, 这次上传已经取代了它
+    # (/compile 只认最近一条记录) —— 先落地成功再删, 免得这次失败了两头落空
+    prev = store.last_game_record(game)
+    if store.drop_pending(prev):
+        log.info(f'「{game}」上一份待重编的暂存 (记录 {prev.get("id")}) 已被本次上传取代, 已删除')
 
-    # 新游戏绑定目录权限: 必须审核通过 (force/关闭审核不绑定), 编译成败不影响
+    # 新游戏绑定目录权限: 必须审核通过 (force/关闭审核不绑定)。先绑上: 临时性编译失败
+    # 要靠它把名字留给 /compile; 编译器报错、目录被整个移除时再由 _settle 收回
     if record.get('is_new') and record.get('verdict') == 'pass':
         try:
             store.perm_set(game, record['user_id'], record['username'])
@@ -713,7 +729,8 @@ async def _finish_deploy(event, cfg: dict, record: dict, data: bytes, staging: s
     else:
         lines.append(f'📂 目录: {record["target"]} / {res["name"]}/  '
                      f'({record.get("file_count", 0)} 个文件){res["note"]}')
-    if res['backup']:
+    # 面板没开备份时这份只为回滚临时留着, 编译成功就删 —— 不当成「已备份」报出去
+    if res['backup'] and not res['backup_temp']:
         lines.append(f'♻️ 旧内容已备份: {os.path.basename(res["backup"])}')
     if record.get('game_name'):
         lines.append(f'🎮 游戏名称: {record["game_name"]}')
@@ -722,8 +739,11 @@ async def _finish_deploy(event, cfg: dict, record: dict, data: bytes, staging: s
     lines.append(f'🆔 记录: {record["id"]}')
 
     if not cfg.get('compile_enabled', True):
-        # 未启用自动编译: 保持旧行为收尾 (通知部署人员), 记录标记 disabled
+        # 未启用自动编译: 保持旧行为收尾 (通知部署人员), 记录标记 disabled。
+        # 不会有编译结论, 也就谈不上回滚 —— 只为回滚留的临时备份现在就删
         record['compile'] = {'status': 'disabled', 'ok': False, 'error': '自动编译未启用'}
+        if record.get('backup_temp') and deploy.discard_backup(record.get('backup')):
+            record['backup'] = ''
         store.append_review_text(record['id'], '## 编译结果\n- 状态: 未启用自动编译')
         _persist(record)
         lines.append('🔧 自动编译未启用, 需手动编译后生效')
@@ -762,6 +782,14 @@ async def _compile_and_report(event, cfg: dict, record: dict, game: str) -> dict
             cfg, f'新游戏《{_restart_game_name(record, game)}》')
         record['restart'] = {k: restart.get(k) for k in _RESTART_RECORD_KEYS}
         notes.append('## 计划重启请求\n' + compilemod.describe_restart(restart))
+
+    # ---- 收拾服务器上的代码: 编不过 (或没验证成) 的不留在 games/ 下 ----
+    # 必须排在报告与落盘之前: 两者都要写明服务器上现在是什么样
+    rollback = await asyncio.to_thread(_settle, record, result, game)
+    if rollback:
+        record['rollback'] = rollback
+        notes.append('## 服务器上的代码\n- ' + deploy.describe_rollback(record)
+                     + (f'\n- 错误: {rollback["error"]}' if rollback.get('error') else ''))
     store.append_review_text(record['id'], '\n\n'.join(notes))
     # 编译没成 → 出报告页: 完整报错与编译日志尾部群消息里塞不下 (日志还掺着源码,
     # 本来就只进留档), 而要看它的恰恰是进不了后台的上传者。disabled 不是失败, 跳过。
@@ -775,7 +803,7 @@ async def _compile_and_report(event, cfg: dict, record: dict, game: str) -> dict
     return result
 
 
-def _fail_next_step(result: dict, game: str) -> str:
+def _fail_next_step(result: dict, game: str, record: dict) -> str:
     """编译没成时的出路 —— 按失败性质二选一, 不把两条路一起摆出来。
 
     默认路是**改完重传**: 绝大多数编译失败就是代码编不过, 拿 /compile 去重编一份
@@ -784,8 +812,84 @@ def _fail_next_step(result: dict, game: str) -> str:
     原样重传又会撞上查重拒收。
     """
     if compilemod.is_transient(result):
-        return f'> 💡 属于临时问题 (编译进程被占用/服务未就绪)，源码已在服务器上，稍后发 /compile {game} 重试即可，无需重传'
+        kept = ('新代码已暂存' if (record.get('rollback') or {}).get('pending')
+                else '源码已在服务器上')
+        return f'> 💡 属于临时问题 (编译进程被占用/服务未就绪)，{kept}，稍后发 /compile {game} 重试即可，无需重传'
     return '> 💡 编译器报错，代码本身无法编译，请按错误日志修改源码后重新 /upload 上传'
+
+
+# ==================== 编译没成: 恢复原状 ====================
+
+def _settle(record: dict, result: dict, game: str) -> dict:
+    """编译有了结论, 收拾服务器上的代码 —— games/ 下只留编得过的东西。
+
+    · 成功: 新代码留下; 只为回滚临时留的旧版本 (面板没开备份) 这时删掉, 返回空;
+    · 上传者只剩改完重传 (compile.needs_reupload): 新代码直接撤掉、上一版本放回;
+      新游戏就是整个目录移除, 连同这次自动加的绑定 —— 下次上传照旧按新游戏走
+      (完整编译 + 成功后请求计划重启);
+    · 其余 (临时问题 / 接口地址配错): 同样恢复原状, 但新代码挪进 data/pending/ 暂存,
+      /compile 时换回去再编。留在 games/ 下的话, 万一它本身就编不过, 这期间谁做一次
+      完整编译都会卡在它身上。
+
+    返回登记进 ``record['rollback']`` 的 ``{ok, action, error, pending, unbound}``
+    (action 见 deploy.rollback; pending 是相对 data/ 的暂存路径), 没动文件返回空。
+    """
+    if result.get('ok'):
+        if record.get('backup_temp') and deploy.discard_backup(record.get('backup')):
+            record['backup'] = ''
+        return {}
+    if result.get('status') == 'disabled':
+        return {}
+    if record.get('replaced') is None or not record.get('dest'):
+        # 旧版本插件写下的记录 (/compile 沿用过来) 没有回滚要用的信息: 分不清原来有没有
+        # 这个目录, 猜错了就是把整个游戏删掉 —— 宁可不动, 交给被 @ 的开发者
+        return {'ok': False, 'action': '', 'pending': '', 'unbound': False, 'taken': False,
+                'skipped': True,
+                'error': '这条记录由旧版本插件写入, 缺少回滚所需的信息, 服务器上的文件没有动'}
+    target = config.upload_target()
+    park = ''
+    if not compilemod.needs_reupload(result):
+        park = store.pending_path(record['id'], os.path.basename(record['dest']))
+    out = deploy.rollback(target, record['dest'], record.get('backup'), record['replaced'], park)
+    unbound = False
+    if out['ok'] and not park and out['action'] == 'removed' and record.get('is_new'):
+        unbound = _unbind(record, game)
+        if unbound:
+            record['perm_bound'] = False    # 面板「新游戏」一栏据此显示, 别留着「已绑定」
+    if out['ok'] and out['action'] == 'restored':
+        record['backup'] = ''               # 已经放回原位, 不再是一份备份
+    return {'ok': out['ok'], 'action': out['action'], 'error': out['error'],
+            'taken': out['taken'], 'unbound': unbound,
+            'pending': (os.path.relpath(out['parked'], store.DATA_DIR).replace('\\', '/')
+                        if out['parked'] else '')}
+
+
+def _unbind(record: dict, game: str) -> bool:
+    """新游戏整个撤掉时, 收回这次自动加的目录绑定 —— 游戏从没上线过, 名字不该一直占着。
+
+    只收这次上传绑上的那一条: 得是自动绑定的, 绑的也还是这位上传者 (中途被管理员
+    改绑过的不动)。临时性失败不走这里 —— 那时名字要留给 /compile。
+    """
+    if not record.get('perm_bound'):
+        return False
+    owner = store.perm_get(game)
+    uploader = record.get('uploader_id') or record.get('user_id') or ''
+    if not owner or owner.get('user_id') != uploader:
+        return False
+    try:
+        return store.perm_delete(game)
+    except OSError as e:
+        log.warning(f'收回目录绑定失败 ({game}): {e}')
+        return False
+
+
+def _rollback_lines(record: dict) -> list:
+    """编译失败消息里的回滚说明。"""
+    text = deploy.describe_rollback(record)
+    if not text:
+        return []
+    ok = (record.get('rollback') or {}).get('ok')
+    return [('↩️ ' if ok else '⚠️ ') + text]
 
 
 def _compile_reason(result: dict) -> str:
@@ -850,15 +954,21 @@ async def handle_recompile(event, argline: str) -> bool:
         return False
     # 编译器真跑起来并报错 = 代码本身编不过, 重编同一份源码结果不会变 —— 这条指令
     # 只给临时性失败用。压根没编过 (当时面板没开自动编译) 的记录不在此列, 照常放行。
-    if st == 'invalid':
-        await _send(event, f'❌ 目录名「{game}」不被编译 API 接受 (记录 {last.get("id")}), 重编也一样过不去\n'
-                           '请改用纯英文目录名 (字母/数字/下划线/连字符) 重新 /upload 上传')
+    # 判据与「失败后新代码是撤掉还是暂存」是同一个 (compile.needs_reupload): 这里拒的,
+    # 当时就已经撤掉了, 服务器上本来也没有可重编的东西
+    if compilemod.needs_reupload(comp):
+        if st == 'invalid':
+            await _send(event, f'❌ 目录名「{game}」不被编译 API 接受 (记录 {last.get("id")})\n'
+                               '请改用纯英文目录名 (字母/数字/下划线/连字符) 重新 /upload 上传')
+        else:
+            await _send(event, f'❌ 目录「{game}」上次是编译器报错 (记录 {last.get("id")}), '
+                               '重编同一份源码只会得到同样的结果\n'
+                               '请按编译日志修改源码后重新 /upload 上传\n'
+                               '> 💡 /compile 只适用于编译进程被占用、编译服务未就绪这类临时失败')
         return False
-    if st == 'failed' and not compilemod.is_transient(comp):
-        await _send(event, f'❌ 目录「{game}」上次是编译器报错 (记录 {last.get("id")}), '
-                           '重编同一份源码只会得到同样的结果\n'
-                           '请按编译日志修改源码后重新 /upload 上传\n'
-                           '> 💡 /compile 只适用于编译进程被占用、编译服务未就绪这类临时失败')
+    if (last.get('rollback') or {}).get('pending') and not store.pending_of(last):
+        await _send(event, f'❌ 目录「{game}」暂存的新代码已不在 (记录 {last.get("id")}, '
+                           '可能已在后台被清理), 无法重新编译\n请联系管理员处理')
         return False
     if not cfg.get('compile_enabled', True):
         await _send(event, '❌ 自动编译未在面板启用')
@@ -882,6 +992,10 @@ async def _run_recompile(event, cfg: dict, game: str, last: dict):
 
     另起一条而不是改旧记录: records.jsonl 只追加; 而且新记录会被
     store.last_game_record 优先取到 —— 编译一旦成功, 这条指令自然就用不了了。
+
+    上次失败时新代码若已挪进 data/pending/ (见 _settle), 先把它换回 games/ 再编 ——
+    走的是与上传同一套落地 (当前内容照样先挪进备份), 编完照样按结果收拾。没有暂存
+    的 (旧版本插件留下的记录, 或当时没撤下来) 就编服务器上现有的。
     """
     global _busy
     rid = store.new_record_id()
@@ -906,6 +1020,13 @@ async def _run_recompile(event, cfg: dict, game: str, last: dict):
         'verdict': last.get('verdict') or '',
         'game_name': last.get('game_name') or '',
         'game_desc': last.get('game_desc') or '',
+        # 回滚要用的落地信息: 没有暂存可换时沿用上次的 (编的就是上次落地的那份)
+        'dest': last.get('dest') or '',
+        'backup': last.get('backup') or '',
+        'replaced': last.get('replaced'),
+        'backup_temp': bool(last.get('backup_temp')),
+        'perm_bound': bool(last.get('perm_bound')),
+        'uploader_id': last.get('uploader_id') or last.get('user_id') or '',
         'compile': {},
         'restart': {},
         'error': '',
@@ -920,6 +1041,21 @@ async def _run_recompile(event, cfg: dict, game: str, last: dict):
                 f'- 发起人: {record["username"] or record["user_id"]}\n'
                 f'- 目录: {game}\n- 依据记录: {last.get("id")}'))
     try:
+        held = store.pending_of(last)
+        if held:
+            res = await asyncio.to_thread(deploy.deploy_pending, held, game, record['folder'],
+                                          config.upload_target(), cfg)
+            if not res['ok']:
+                # 暂存还在原处: 把登记一并带到这条新记录上, 否则 /compile 下次只看得到
+                # 这条 (last_game_record 取最近一条), 那份暂存就再也够不着了
+                record.update(error=res['error'], rollback=dict(last.get('rollback') or {}))
+                _persist(record)
+                await _send(event, _fail_text(record, cfg, '暂存的新代码没能放回服务器'), active=True)
+                return
+            record.update(dest=res['dest'], backup=res['backup'], replaced=res['replaced'],
+                          backup_temp=res['backup_temp'],
+                          redeployed=(last.get('rollback') or {}).get('pending') or '')
+            store.append_review_text(rid, f'已把记录 {last.get("id")} 暂存的新代码放回服务器后再编译')
         await _send(event, f'🔧 已请求重新编译「{_game_label(record, game)}」'
                            + ('（新游戏完整编译, 耗时更长）' if record['is_new'] else '')
                            + ', 请耐心等待结果…')
@@ -954,7 +1090,10 @@ def _record_outcome(rec: dict) -> str:
     if stage == 'deployed':
         comp = (rec.get('compile') or {}).get('status')
         label = compilemod.STATUS_LABELS.get(comp, comp) if comp else ''
-        return '已部署' + (f', {label}' if label else '')
+        rb = rec.get('rollback') or {}
+        tail = ('' if not rb.get('ok') else ', 新代码已暂存待重编' if rb.get('pending')
+                else ', 已回滚')
+        return '已部署' + (f', {label}' if label else '') + tail
     if rec.get('manual'):
         return '审核服务异常, 需人工处理'
     if rec.get('verdict') == 'reject':
@@ -1052,7 +1191,8 @@ def _compile_text(cfg: dict, record: dict, result: dict, game: str,
         ]
         if link:
             lines.append(link)
-        lines.append(_fail_next_step(result, game))
+        lines += _rollback_lines(record)
+        lines.append(_fail_next_step(result, game, record))
         if at_dev:
             lines.append(at_dev + ' 请复查编译问题')
         return '\n'.join(lines)
@@ -1071,10 +1211,11 @@ def _compile_text(cfg: dict, record: dict, result: dict, game: str,
         # 有报告页就给链接: 上传者要的正是编译器日志, 而后台他进不去
         link or '📄 编译日志与 API 返回已留档, 请在后台「LGTBot 自动部署」页查看',
     ]
+    lines += _rollback_lines(record)
     # 这两种上传者做什么都没用 —— 目标名非法要换合规目录名, 接口配置错了得管理员
     # 去面板改; 给「改代码重传」或「稍后重编」都是把人往沟里带, 交给被 @ 的开发者
     if st not in ('invalid', 'misconfig'):
-        lines.append(_fail_next_step(result, game))
+        lines.append(_fail_next_step(result, game, record))
     if at_dev:
         lines.append(at_dev + ' 请复查编译问题')
     return '\n'.join(lines)

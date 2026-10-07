@@ -128,11 +128,12 @@ pre.raw{background:var(--card2);border:1px solid var(--border);border-radius:12p
       </div>
       <div class="grid2" style="margin-bottom:0">
         <label class="switch"><input type="checkbox" id="enabled"> 启用插件</label>
-        <label class="switch"><input type="checkbox" id="keep_replaced_backup"> 替换前备份旧内容到 data/backups</label>
+        <label class="switch"><input type="checkbox" id="keep_replaced_backup"> 编译成功后保留旧版本到 data/backups</label>
       </div>
       <div class="hint" style="margin-top:10px">
         用法：<code>/upload</code> 引用压缩包 → 解压到上传目录下的同名文件夹；
         <code>/upload &lt;文件夹名&gt;</code> 引用单文件 → 写入上传目录下已存在的这个文件夹；重名一律直接替换。
+        编译没过会自动恢复原状（老游戏放回上一版本，新游戏整个目录移除）。
       </div>
     </div>
 
@@ -293,7 +294,7 @@ pre.raw{background:var(--card2);border:1px solid var(--border);border-radius:12p
       </h3>
       <div id="dir-stats" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px"></div>
       <div id="file-table"></div>
-      <div class="hint" style="margin-top:10px">备份（backups/）按整个文件夹展示与删除，不展开内部文件。</div>
+      <div class="hint" style="margin-top:10px">备份（backups/）与待重编暂存（pending/）按整个文件夹展示与删除，不展开内部文件。</div>
     </div>
   </div>
 </div>
@@ -483,8 +484,32 @@ function compilePill(rec){
   if(!st)return '';
   if(st==='success')return ' <span class="pill ok">编译✓</span>';
   if(st==='disabled')return ' <span class="pill gray">未编译</span>';
-  if(st==='timeout')return ' <span class="pill man">编译超时</span>';
-  return ' <span class="pill no">'+esc(COMPILE_LABEL[st]||'编译✗')+'</span>';
+  return (st==='timeout'?' <span class="pill man">编译超时</span>'
+    :' <span class="pill no">'+esc(COMPILE_LABEL[st]||'编译✗')+'</span>')+rollbackPill(rec);
+}
+/* 编译没过之后服务器上的代码怎么样了（对应 app/deploy.py 的 describe_rollback）。
+   面板只有管理员看得到，回滚的报错原文（带服务器路径）在这里可以展示 */
+function rollbackPill(rec){
+  const rb=rec.rollback;
+  if(!rb||rb.skipped)return '';
+  if(!rb.ok)return ' <span class="pill no">回滚失败</span>';
+  return rb.pending?' <span class="pill man">暂存待重编</span>':' <span class="pill gray">已回滚</span>';
+}
+function rollbackText(rec){
+  const rb=rec.rollback||{};
+  if(!Object.keys(rb).length)return '-';
+  const single=rec.mode==='file';
+  let t;
+  if(rb.skipped)t='未自动回滚（依据的是旧版本插件的记录），新代码仍在服务器上';
+  else if(!rb.ok)t=!rb.taken?'自动回滚失败，新代码仍在服务器上'
+    :(rb.pending?'新代码已暂存待重编':'新代码已撤下')+'，但上一版本没能放回服务器';
+  else if(rb.pending)t='新代码已暂存待重编（'+rb.pending+'），'
+    +(rb.action==='restored'?'服务器上暂时恢复为上一版本':single?'新加的文件暂时从服务器上撤下':'新游戏目录暂时从服务器上撤下');
+  else if(rb.action==='restored')t='已回滚：编不过的新代码已撤下，服务器上恢复为上一版本';
+  else if(single)t='已回滚：新加的文件已从服务器上撤下';
+  else t='已回滚：新游戏目录已移除，下次上传仍按新游戏处理'+(rb.unbound?'，自动绑定的目录权限已一并收回':'');
+  if(rb.error&&!rb.skipped)t+='；错误：'+String(rb.error).slice(0,200);
+  return t;
 }
 function compileText(c){
   if(!c||!c.status)return '-';
@@ -570,6 +595,7 @@ async function openRecord(id){
     ['审核 HTTP 状态',rec.http_status??'-'],['审核尝试次数',rec.attempts||'-'],
     ['新游戏',rec.is_new?'是'+(rec.perm_bound?'（已绑定目录权限）':'（未绑定权限）'):'否'],
     ['编译结果',compileText(rec.compile)],['计划重启',restartText(rec.restart)],
+    ['服务器上的代码',rollbackText(rec)],
     ['落地路径',rec.dest||'-'],['旧内容备份',rec.backup||'-'],
     ['压缩包留档',rec.archive_file||'-'],['审核留档',rec.review_file||'-'],
     ['内容 SHA256',rec.sha256||'-'],['依据记录',rec.source_record||'-'],
@@ -702,9 +728,10 @@ function renderDirStats(stats){
   ).join('');
 }
 function fileRow(f){
-  if(f.kind==='backup'){
+  if(f.kind==='backup'||f.kind==='pending'){
+    const what=f.kind==='pending'?'待重编暂存（删掉后该记录无法再 /compile）':'备份文件夹';
     return `<tr>
-      <td class="mono">📁 ${esc(f.display)}<div class="hint">备份文件夹 · ${f.count||0} 个文件</div></td>
+      <td class="mono">📁 ${esc(f.display)}<div class="hint">${what} · ${f.count||0} 个文件</div></td>
       <td class="mono">${fmtSize(f.size)}</td>
       <td class="mono">${fmtTime(f.mtime)}</td>
       <td style="white-space:nowrap">
@@ -740,8 +767,9 @@ async function viewFile(path){
   $('modal-mask').classList.add('show');
 }
 async function delFile(path,isBackup){
-  const tip=isBackup?('删除整个备份文件夹 '+path.replace(/^backups\//,'')+' ？其中全部文件将一并删除。')
-                    :('删除 '+path+' ？');
+  const tip=!isBackup?('删除 '+path+' ？')
+    :/^pending\//.test(path)?('删除待重编暂存 '+path.replace(/^pending\//,'')+' ？删除后这条记录无法再 /compile，上传者只能重新上传。')
+    :('删除整个备份文件夹 '+path.replace(/^backups\//,'')+' ？其中全部文件将一并删除。');
   if(!confirm(tip))return;
   const r=await api('/file/delete','POST',{path});
   toast(r.success?'已删除':(r.error||'删除失败'));

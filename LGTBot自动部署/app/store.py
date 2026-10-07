@@ -8,6 +8,7 @@
     ├── staging/<记录号>/        解压暂存 (部署或失败后清理)
     ├── backups/<名称>.<时间戳>[/…]  替换时备份的旧目录/旧文件 (面板按整夹展示与删除)
     ├── backups/<文件夹>/<文件>.<时间戳>  单文件替换的备份
+    ├── pending/<记录号>/<名称>     编译临时失败时从 games/ 撤下的新代码, 等 /compile 换回去
     ├── diagnostics/<记录号>.json  未能定位到文件时的原始消息载荷
     └── reports/<记录号>-<随机串>.html  审核未通过/编译失败的报告页 (见 report.py)
 """
@@ -28,6 +29,7 @@ REVIEWS_DIR = os.path.join(DATA_DIR, 'reviews')
 ARCHIVES_DIR = os.path.join(DATA_DIR, 'archives')
 STAGING_DIR = os.path.join(DATA_DIR, 'staging')
 BACKUPS_DIR = os.path.join(DATA_DIR, 'backups')
+PENDING_DIR = os.path.join(DATA_DIR, 'pending')
 DIAG_DIR = os.path.join(DATA_DIR, 'diagnostics')
 # 唯一一个会被 Web 服务器直接对外提供的目录 (站点侧反代), 文件名带随机串防枚举
 REPORTS_DIR = os.path.join(DATA_DIR, 'reports')
@@ -37,8 +39,8 @@ _SAFE_NAME = '-_.'
 
 
 def init():
-    for d in (DATA_DIR, REVIEWS_DIR, ARCHIVES_DIR, STAGING_DIR, BACKUPS_DIR, DIAG_DIR,
-              REPORTS_DIR):
+    for d in (DATA_DIR, REVIEWS_DIR, ARCHIVES_DIR, STAGING_DIR, BACKUPS_DIR, PENDING_DIR,
+              DIAG_DIR, REPORTS_DIR):
         os.makedirs(d, exist_ok=True)
 
 
@@ -191,6 +193,10 @@ def delete_record(rid: str, with_files: bool = True) -> dict:
         # 报告页文件名带不可推导的随机串, 只能按记录里登记的路径删 —— 漏删就等于
         # 记录已消失、页面还挂在公网上
         _drop(resolve(str(target.get('report_file') or '')))
+        # 记录一删 /compile 就找不到它了, 暂存的新代码再留着只是白占地方
+        held = pending_of(target)
+        if held and drop_pending(target):
+            removed.append(os.path.relpath(os.path.dirname(held), DATA_DIR).replace('\\', '/'))
     return {'ok': True, 'error': '', 'files': removed}
 
 
@@ -360,6 +366,40 @@ def cleanup_staging(rid: str):
     shutil.rmtree(os.path.join(STAGING_DIR, rid), ignore_errors=True)
 
 
+# ==================== 待重编暂存 ====================
+# 编译临时失败 (编译进程被占用、服务未就绪、超时…) 时, 新代码从 games/ 撤下来放进
+# pending/<记录号>/<名称>, games/ 先恢复成部署前的样子; /compile 再把它换回去编。
+# 只有某游戏**最近一条**落地记录的暂存是有用的 (/compile 只看那一条), 更新的上传
+# 一落地, 前一份就由 flow 调 drop_pending 收掉。
+
+def pending_path(rid: str, name: str) -> str:
+    return os.path.join(PENDING_DIR, safe_filename(rid), name)
+
+
+def pending_of(rec: dict | None) -> str:
+    """记录登记的暂存的绝对路径; 没登记或文件已不在返回空串。"""
+    rel = str(((rec or {}).get('rollback') or {}).get('pending') or '')
+    full = resolve(rel)
+    root = os.path.realpath(PENDING_DIR)
+    if not full or not full.startswith(root + os.sep) or not os.path.exists(full):
+        return ''
+    return full
+
+
+def drop_pending(rec: dict | None) -> bool:
+    """删掉记录登记的暂存 (连同 pending/<记录号>/ 这一层)。"""
+    full = pending_of(rec)
+    if not full:
+        return False
+    unit = os.path.dirname(full)
+    # 只删 pending/<记录号>/ 这一层: 登记路径若被改成 pending/<x>, dirname 就是
+    # pending/ 本身, 那会把所有人的暂存一锅端
+    if os.path.dirname(unit) != os.path.realpath(PENDING_DIR):
+        return False
+    shutil.rmtree(unit, ignore_errors=True)
+    return not os.path.exists(unit)
+
+
 # ==================== 面板文件浏览 ====================
 
 _TEXT_VIEW_EXTS = ('.md', '.txt', '.json', '.jsonl', '.yaml', '.yml', '.log')
@@ -378,12 +418,14 @@ def resolve(rel: str) -> str | None:
 
 
 # 模块目录统计的固定展示顺序 (其后追加未知目录, 最后是根目录散文件)
-_KNOWN_DIRS = ('reviews', 'archives', 'backups', 'diagnostics', 'staging')
+_KNOWN_DIRS = ('reviews', 'archives', 'backups', 'pending', 'diagnostics', 'staging')
+# 按「整夹」展示与删除的目录: backups/ 的备份单元、pending/ 的待重编暂存
+_UNIT_DIRS = {'backups': 'backup', 'pending': 'pending'}
 _ROOT_STAT = '(根目录)'
 
 
 def _backup_unit(rel: str) -> str:
-    """把 backups/ 内文件的相对路径归到「备份单元」。
+    """把 backups/ (及 pending/) 内文件的相对路径归到「备份单元」。
 
     备份直接落在 backups/ 下 (不再分目标子目录): 目录备份是
     backups/<名称>.<时间戳>/..., 单文件备份是 backups/<文件夹>/<文件>.<时间戳>。
@@ -400,7 +442,9 @@ def list_entries() -> dict:
     返回 ``{'entries': [...], 'stats': [...]}``:
       · entries — 普通文件为 {path, display, size, mtime, viewable, kind:'file'};
         backups/ 内的文件聚合成 {path, display, size, mtime, count, kind:'backup'},
-        display 去掉 backups/ 前缀 (如 "lgtbot/gomoku.xxx"), 不展示内部文件。
+        display 去掉 backups/ 前缀 (如 "lgtbot/gomoku.xxx"), 不展示内部文件;
+        pending/ 同样按 pending/<记录号> 聚合成 kind:'pending', display 为
+        「<记录号>/<游戏目录或文件名>」。
       · stats — 每个顶层模块目录的 {name, size, count}, 已知目录即使为空也列出。
     """
     init()
@@ -421,8 +465,11 @@ def list_entries() -> dict:
             bucket = stats.setdefault(top, {'name': top, 'size': 0, 'count': 0})
             bucket['size'] += st.st_size
             bucket['count'] += 1
-            if rel.startswith('backups/'):
-                unit = units.setdefault(_backup_unit(rel), {'size': 0, 'mtime': 0, 'count': 0})
+            if top in _UNIT_DIRS:
+                parts = rel.split('/')
+                unit = units.setdefault(_backup_unit(rel), {
+                    'size': 0, 'mtime': 0, 'count': 0, 'kind': _UNIT_DIRS[top],
+                    'display': '/'.join(parts[1:3] if top == 'pending' else parts[1:2])})
                 unit['size'] += st.st_size
                 unit['count'] += 1
                 unit['mtime'] = max(unit['mtime'], int(st.st_mtime))
@@ -438,12 +485,12 @@ def list_entries() -> dict:
     for path, u in units.items():
         entries.append({
             'path': path,
-            'display': path[len('backups/'):] or path,
+            'display': u['display'] or path,
             'size': u['size'],
             'mtime': u['mtime'],
             'count': u['count'],
             'viewable': False,
-            'kind': 'backup',
+            'kind': u['kind'],
         })
     entries.sort(key=lambda x: x['mtime'], reverse=True)
     order = {name: i for i, name in enumerate(_KNOWN_DIRS)}
@@ -475,16 +522,17 @@ def read_file(rel: str) -> tuple[str, str]:
 def delete_entry(rel: str) -> str:
     """删除 data/ 内的留档文件或备份文件夹; 返回错误信息 (空串 = 成功)。
 
-    目录删除只允许发生在 backups/ 内 (面板的备份单元整夹删除), 其余模块目录
+    目录删除只允许发生在 backups/ 与 pending/ 内 (面板的整夹删除), 其余模块目录
     (reviews/ archives/ …) 只能按单个文件删; 配置文件禁止删除。
     """
     full = resolve(rel)
     if not full or not os.path.exists(full):
         return '文件不存在'
     if os.path.isdir(full):
-        broot = os.path.realpath(BACKUPS_DIR)
-        if full == broot or not full.startswith(broot + os.sep):
-            return '只允许删除 backups 下的备份文件夹'
+        broot = next((r for r in map(os.path.realpath, (BACKUPS_DIR, PENDING_DIR))
+                      if full.startswith(r + os.sep)), '')
+        if not broot:
+            return '只允许删除 backups 或 pending 下的文件夹'
         shutil.rmtree(full, ignore_errors=True)
         if os.path.exists(full):
             return '删除失败, 文件可能被占用'

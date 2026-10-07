@@ -28,7 +28,7 @@ import time
 
 from core.base.logger import PLUGIN, get_logger
 
-from . import review, store
+from . import deploy, review, store
 
 log = get_logger(PLUGIN, 'LGTBot自动部署')
 
@@ -224,6 +224,8 @@ def build_compile(record: dict, result: dict, game: str) -> str:
     if term:
         rows.append(('取消请求', ('成功' if term.get('ok') else '失败')
                      + f' ({term.get("message", "")})'))
+    # 只用固定文案: 回滚的报错原文带服务器路径, 这页在公网上
+    rows.append(('服务器上的代码', deploy.describe_rollback(record)))
     rows += _meta_rows(record)
 
     # error 与 log_tail 都可能带出编译机的 IP:端口 —— 这页在公网上, 先遮蔽
@@ -232,9 +234,11 @@ def build_compile(record: dict, result: dict, game: str) -> str:
     body += _sec('编译日志 (尾部)', _pre(review.mask_addr(result.get('log_tail'))))
     # 出路按失败性质分岔, 别把两条路一起摆出来 (判据见 compile.is_transient)
     if compilemod.is_transient(result):
+        kept = ('新代码已<b>暂存</b>在服务器上，'
+                if (record.get('rollback') or {}).get('pending') else '也已经在服务器上，')
         body += _sec('接下来怎么办', _tip(
-            '这属于<b>临时问题</b>（编译进程被占用、编译服务未就绪等），源码本身没问题、'
-            f'也已经在服务器上，<b>无需重传</b> —— 在群里发 <code>/compile {_esc(game)}</code> '
+            '这属于<b>临时问题</b>（编译进程被占用、编译服务未就绪等），源码本身没问题；'
+            f'{kept}<b>无需重传</b> —— 在群里发 <code>/compile {_esc(game)}</code> '
             '重试即可。'))
     elif st == 'invalid':
         body += _sec('接下来怎么办', _tip(

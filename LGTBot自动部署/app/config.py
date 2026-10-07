@@ -33,7 +33,7 @@ DEFAULTS = {
     'required_files': ['achievements.h', 'icon.png', 'mygame.cc',
                        'option.cmake', 'options.h', 'rule.md', 'unittest.cc'],
     # ---- 部署 ----
-    'keep_replaced_backup': True,  # 替换前把旧目录/旧文件备份到 data/backups
+    'keep_replaced_backup': True,  # 编译成功后仍保留被替换的旧版本 (编译出结论前总会临时留着, 供回滚)
     'keep_archive': True,        # 是否把原压缩包留档到 data/archives
     # ---- 审核 (仅文字: 图片/字体等二进制资源不送审) ----
     'review_enabled': True,      # 关闭后不做内容审核, 直接部署 (仅用于上游故障应急)
@@ -67,7 +67,7 @@ _COMMENTS = {
     'notify_users': '每次执行完成后在群内 @ 的部署人员 openid (force 强制上传不通知)',
     'upload_dir': 'lgtbot 上传目录 (服务器绝对路径), /upload 的唯一落地位置',
     'required_files': '压缩包必须包含的文件清单 (按文件名匹配, 任意层级), 缺一即拒绝 (force 同样检查); 空列表 = 不检查',
-    'keep_replaced_backup': '替换前是否把旧目录/旧文件备份到 data/backups',
+    'keep_replaced_backup': '编译成功后是否继续保留被替换的旧目录/旧文件 (data/backups); 关闭也会先临时留着, 编译失败时用它回滚, 成功后才删',
     'keep_archive': '是否把原压缩包留档到 data/archives',
     'review_enabled': '是否启用内容审核 (关闭后直接部署)',
     'review_prompt': '追加到内置审核标准之后的自定义要求',

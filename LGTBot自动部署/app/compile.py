@@ -362,6 +362,26 @@ def is_transient(result: dict) -> bool:
     return int(result.get('http_status') or 0) in (409, 503, 504)
 
 
+def needs_reupload(result: dict) -> bool:
+    """这次失败之后, 上传者是不是**只剩改完重传**这一条路 (/compile 不放行)。
+
+    编译器报错 (及其余非临时失败) 与目标名非法属于这类; 临时问题、接口地址配错、
+    没开自动编译都还能 /compile。它同时决定两件事, 放在一处免得两边走岔:
+
+    · flow.handle_recompile 拒不拒 /compile;
+    · 失败后服务器上的新代码怎么收: 是 → 直接撤掉 (这份代码不会再被用到);
+      否 → 挪进 data/pending/ 暂存, 等 /compile 换回去再编。两种都会先把
+      games/ 恢复成部署前的样子 —— 编不过 (或还没验证过) 的代码留在那里, 下次
+      完整编译就会卡在它身上。
+    """
+    if not result or result.get('ok'):
+        return False
+    st = result.get('status')
+    if st == 'invalid':
+        return True
+    return st == 'failed' and not is_transient(result)
+
+
 def describe(result: dict) -> str:
     """留档用的编译结果解析 (含 API 原始返回)。"""
     if not result:
