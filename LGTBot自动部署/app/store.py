@@ -105,15 +105,17 @@ def list_records(limit: int = 200) -> list:
     return out
 
 
-def find_by_sha(sha: str, exclude_id: str = '') -> dict | None:
+def find_by_sha(sha: str, exclude_id: str = '', accept=None) -> dict | None:
     """按内容 sha256 找最近一条同内容记录 (重复上传拒收用)。
 
-    只认字节完全一致 —— 改了一个字符 sha 就变, 不会误伤真正的更新。
+    只认字节完全一致 —— 改了一个字符 sha 就变, 不会误伤真正的更新。``accept`` 给定时
+    只认它放行的记录: flow 用它跳过没对内容下结论的那些 (见 flow._settled)。
     """
     if not sha:
         return None
     return next((r for r in list_records(_MAX_RECORDS)
-                 if r.get('sha256') == sha and r.get('id') != exclude_id), None)
+                 if r.get('sha256') == sha and r.get('id') != exclude_id
+                 and (accept is None or accept(r))), None)
 
 
 def last_game_record(game: str) -> dict | None:

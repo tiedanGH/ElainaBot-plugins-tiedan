@@ -348,14 +348,15 @@ async def _pipeline(event, cfg: dict, ref: dict, record: dict, target: dict, fol
     record['size'] = len(data)
 
     # 2.5) 内容查重: 字节完全一致的包直接拒收, 不重复占审核额度与编译时间。
-    # 无论上次过没过审都拒 —— 内容一个字节没改, 重传不会得出不同结论。
+    # 只要上次对这份内容下过结论就拒, 不管过没过审 —— 内容一个字节没改, 重传不会得出
+    # 不同结论。上次是插件自己出了状况、没得出结论的 (任务被取消等) 不拦, 见 _settled。
     #
     # force 例外: 那是主人的运维操作, 本来就绕过内容审核, 再拿查重挡他没有意义 ——
     # 查重是替普通上传者省一轮无谓的审核, 而主人重传同一个包往往正是**想要**的
     # (服务器侧出过状况需要重新落地一次, 而删记录只为绕开一道限制未免太绕)。
     # 仍然算出并记下 sha256: 后续记录要靠它查重, 少记一条会让下次重传漏检。
     record['sha256'] = hashlib.sha256(data).hexdigest()
-    dup = None if force else store.find_by_sha(record['sha256'], rid)
+    dup = None if force else store.find_by_sha(record['sha256'], rid, accept=_settled)
     if dup:
         record.update(stage='duplicate',
                       error=f'与记录 {dup.get("id")} 完全一致 (SHA256 相同), '
@@ -1216,16 +1217,33 @@ _STAGE_TEXT = {
 }
 
 
+def _settled(rec: dict) -> bool:
+    """这条记录有没有对「这份内容」下过结论 —— 下过的才拦同内容重传 (见 _pipeline 查重)。
+
+    拦的理由是内容一个字节没改、再来一遍结论也不会变: 审核不通过、编译失败 (代码问题
+    得改代码; 临时性的有 /compile)、包本身不合规 (缺文件 / 隐藏文件 / .py / 送审超限 /
+    解压校验失败)、已经部署成功。
+    插件或服务自己出的状况不算 —— 内容根本没得出结论, 重传正是出路: 任务被取消 (热重载
+    / 重启, 已落地被收拾成暂存的那种也算)、处理异常、下载失败、部署时写盘出错、审核服务
+    异常 (重试耗尽)。重复上传被拒的记录也跳过: 它只是指着更早那条, 跳过才找得到真正的结论。
+    """
+    if rec.get('cancelled') or rec.get('error') == _CANCELLED or rec.get('manual'):
+        return False
+    return (rec.get('stage') or '') not in ('duplicate', 'cancelled', 'error', 'received',
+                                            'download', 'deploy')
+
+
 def _record_outcome(rec: dict) -> str:
     """把一条历史记录压成一句人话结论 (重复上传提示 / 重新编译提示用)。"""
     stage = rec.get('stage') or ''
-    if stage == 'deployed':
+    if stage in ('deployed', 'recompile'):
         comp = (rec.get('compile') or {}).get('status')
         label = compilemod.STATUS_LABELS.get(comp, comp) if comp else ''
         rb = rec.get('rollback') or {}
         tail = ('' if not rb.get('ok') else ', 新代码已暂存待重编' if rb.get('pending')
                 else ', 已回滚')
-        return '已部署' + (f', {label}' if label else '') + tail
+        return (('已部署' if stage == 'deployed' else '重新编译')
+                + (f', {label}' if label else '') + tail)
     if rec.get('manual'):
         return '审核服务异常, 需人工处理'
     if rec.get('verdict') == 'reject':
@@ -1241,7 +1259,7 @@ def _dup_tip(dup: dict) -> str:
     """
     game = _record_game(dup)
     comp = dup.get('compile') or {}
-    if dup.get('stage') == 'deployed' and game and compilemod.is_transient(comp):
+    if dup.get('stage') in ('deployed', 'recompile') and game and compilemod.is_transient(comp):
         return f'内容没有改动无需重传; 上次是临时性编译失败 —— 直接用 /compile {game} 重试'
     return '内容没有任何改动就不必重传; 请修改后再上传, 或联系管理员人工处理'
 
