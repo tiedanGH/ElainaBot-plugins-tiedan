@@ -37,7 +37,16 @@ _MAX_PROPS_READ = 1000000        # 属性源文件完整读取上限 (防超大�
 
 
 class ArchiveError(Exception):
-    """压缩包非法 / 超限 (错误信息可直接回给群里)。"""
+    """压缩包非法 / 超限。
+
+    两份说法: ``str(e)`` 是给后台的明细, 可以带包内成员路径; ``e.public`` 是能发进群的,
+    只有固定文案与数字。成员名是上传者随便起的, bot 原样发出去, 违规的就是 bot 自己
+    (见插件目录 CLAUDE.md)。没给 public 就用一句笼统的 —— 宁可说少, 不能说漏。
+    """
+
+    def __init__(self, detail: str, public: str = '压缩包校验失败 (详情见后台记录)'):
+        super().__init__(detail)
+        self.public = public
 
 
 class HiddenMemberError(ArchiveError):
@@ -56,13 +65,13 @@ def _safe_member_name(name: str) -> str:
     if not raw or raw in ('.', './'):
         return ''
     if raw.startswith('/') or (len(raw) > 1 and raw[1] == ':'):
-        raise ArchiveError(f'压缩包含绝对路径成员: {name}')
+        raise ArchiveError(f'压缩包含绝对路径成员: {name}', '压缩包含绝对路径成员 (不允许)')
     parts = []
     for part in raw.split('/'):
         if part in ('', '.'):
             continue
         if part == '..':
-            raise ArchiveError(f'压缩包含路径穿越成员: {name}')
+            raise ArchiveError(f'压缩包含路径穿越成员: {name}', '压缩包含路径穿越成员 (../, 不允许)')
         parts.append(part)
     return '/'.join(parts)
 
@@ -104,7 +113,26 @@ def _reject_hidden(names):
         return
     shown = '、'.join(hits[:_MAX_SHOWN_HIDDEN])
     more = f' 等 {len(hits)} 项' if len(hits) > _MAX_SHOWN_HIDDEN else ''
-    raise HiddenMemberError(f'压缩包内含以 . 开头的隐藏文件/目录: {shown}{more}')
+    known = _known_hidden(hits)
+    raise HiddenMemberError(f'压缩包内含以 . 开头的隐藏文件/目录: {shown}{more}',
+                            f'压缩包内含 {len(hits)} 个以 . 开头的隐藏文件/目录'
+                            + (f' (如 {"、".join(known)})' if known else ''))
+
+
+# 隐藏项里常见、可以在群里点名的那几个: 固定词表, 是本插件写的字, 不是上传者起的名字
+_KNOWN_HIDDEN = ('.git', '.github', '.gitignore', '.gitattributes', '.gitmodules', '.DS_Store',
+                 '.vscode', '.vs', '.idea', '.clang-format', '.editorconfig', '.env', '__MACOSX')
+
+
+def _known_hidden(hits) -> list:
+    """命中项里落在 _KNOWN_HIDDEN 词表内的 (去重保序), 群消息只拿这些举例。"""
+    out = []
+    for hit in hits:
+        parts = hit.split('/')
+        name = '__MACOSX' if '__MACOSX' in parts else parts[-1]
+        if name in _KNOWN_HIDDEN and name not in out:
+            out.append(name)
+    return out
 
 
 def is_script(name: str) -> bool:
@@ -140,7 +168,13 @@ def _reject_scripts(names):
         return
     shown = '、'.join(hits[:_MAX_SHOWN_HIDDEN])
     more = f' 等 {len(hits)} 个' if len(hits) > _MAX_SHOWN_HIDDEN else ''
-    raise ScriptMemberError(f'压缩包内含 .py 文件: {shown}{more}')
+    raise ScriptMemberError(f'压缩包内含 .py 文件: {shown}{more}',
+                            f'压缩包内含 {len(hits)} 个 .py 文件')
+
+
+def _limit(msg: str) -> ArchiveError:
+    """只含固定文案与数字的错误 (超限之类): 明细与群里的说法是同一句。"""
+    return ArchiveError(msg, msg)
 
 
 # ==================== 解压 ====================
@@ -150,7 +184,7 @@ def _extract_zip(data: bytes, dest: str, limits: dict) -> int:
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         infos = zf.infolist()
         if len(infos) > limits['max_files']:
-            raise ArchiveError(f'压缩包成员数 {len(infos)} 超过上限 {limits["max_files"]}')
+            raise _limit(f'压缩包成员数 {len(infos)} 超过上限 {limits["max_files"]}')
         _reject_hidden(i.filename for i in infos)
         _reject_scripts(i.filename for i in infos if not i.is_dir())
         for info in infos:
@@ -163,7 +197,7 @@ def _extract_zip(data: bytes, dest: str, limits: dict) -> int:
                 continue
             total += info.file_size
             if total > limits['max_uncompressed']:
-                raise ArchiveError(f'解压后体积超过上限 {limits["max_uncompressed"] / 1048576:.0f} MB')
+                raise _limit(f'解压后体积超过上限 {limits["max_uncompressed"] / 1048576:.0f} MB')
             os.makedirs(os.path.dirname(target), exist_ok=True)
             with zf.open(info) as src, open(target, 'wb') as out:
                 shutil.copyfileobj(src, out, 65536)
@@ -175,7 +209,7 @@ def _extract_tar(data: bytes, dest: str, limits: dict) -> int:
     with tarfile.open(fileobj=io.BytesIO(data), mode='r:*') as tf:
         members = tf.getmembers()
         if len(members) > limits['max_files']:
-            raise ArchiveError(f'压缩包成员数 {len(members)} 超过上限 {limits["max_files"]}')
+            raise _limit(f'压缩包成员数 {len(members)} 超过上限 {limits["max_files"]}')
         _reject_hidden(m.name for m in members)
         _reject_scripts(m.name for m in members if not m.isdir())
         for m in members:
@@ -183,16 +217,17 @@ def _extract_tar(data: bytes, dest: str, limits: dict) -> int:
             if not name:
                 continue
             if m.issym() or m.islnk():
-                raise ArchiveError(f'压缩包含链接成员 (不允许): {m.name}')
+                raise ArchiveError(f'压缩包含链接成员 (不允许): {m.name}', '压缩包含链接成员 (不允许)')
             if not (m.isfile() or m.isdir()):
-                raise ArchiveError(f'压缩包含特殊文件成员 (不允许): {m.name}')
+                raise ArchiveError(f'压缩包含特殊文件成员 (不允许): {m.name}',
+                                   '压缩包含特殊文件成员 (不允许)')
             target = os.path.join(dest, *name.split('/'))
             if m.isdir():
                 os.makedirs(target, exist_ok=True)
                 continue
             total += m.size
             if total > limits['max_uncompressed']:
-                raise ArchiveError(f'解压后体积超过上限 {limits["max_uncompressed"] / 1048576:.0f} MB')
+                raise _limit(f'解压后体积超过上限 {limits["max_uncompressed"] / 1048576:.0f} MB')
             os.makedirs(os.path.dirname(target), exist_ok=True)
             src = tf.extractfile(m)
             if src is None:
@@ -215,7 +250,7 @@ def extract(data: bytes, filename: str, dest: str, limits: dict) -> dict:
     elif low.endswith(('.tar.gz', '.tgz', '.tar.bz2', '.tbz2', '.tar.xz', '.txz', '.tar')):
         total = _extract_tar(data, dest, limits)
     elif low.endswith(('.rar', '.7z')):
-        raise ArchiveError('暂不支持 rar / 7z, 请改用 zip 或 tar.gz 重新打包')
+        raise _limit('暂不支持 rar / 7z, 请改用 zip 或 tar.gz 重新打包')
     else:
         # 无扩展名兜底: 依次尝试 zip / tar
         try:
@@ -224,7 +259,7 @@ def extract(data: bytes, filename: str, dest: str, limits: dict) -> dict:
             try:
                 total = _extract_tar(data, dest, limits)
             except tarfile.TarError as e:
-                raise ArchiveError(f'无法识别的压缩格式: {e}') from e
+                raise ArchiveError(f'无法识别的压缩格式: {e}', '无法识别的压缩格式') from e
     entries = [e for e in os.listdir(dest)]
     root = entries[0] if len(entries) == 1 and os.path.isdir(os.path.join(dest, entries[0])) else ''
     return {'total_size': total, 'root': root}

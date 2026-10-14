@@ -195,8 +195,9 @@ async def request_compile(game: str, cfg: dict, is_new: bool = False) -> dict:
     if cfg_err:
         return _result('misconfig', new=is_new, error=cfg_err)
     if not _TARGET_RE.match(game or ''):
+        # error 会进群消息 (flow._compile_reason): 不带目录名, 那是上传者起的
         return _result('invalid', new=is_new,
-                       error=f'目标名「{game}」不符合编译 API 命名规则 '
+                       error='目录名不符合编译 API 命名规则 '
                              '(仅字母/数字/下划线/连字符, 首字符为字母或下划线)')
 
     wait = max(5, int(cfg.get('compile_timeout') or 180))

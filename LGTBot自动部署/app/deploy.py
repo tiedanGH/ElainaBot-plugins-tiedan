@@ -39,28 +39,29 @@ def strip_archive_ext(name: str) -> str:
 
 
 def bad_name(name: str) -> str:
-    """校验用户可控的目录名 / 压缩包名; 返回错误信息, 空串表示合法。"""
+    """校验用户可控的目录名 / 压缩包名; 返回错误信息, 空串表示合法。
+
+    错误信息**不带名字本身**: 它会被原样发进群, 而名字是上传者起的 (见 CLAUDE.md)。
+    """
     if not name:
         return '名称为空'
     if '/' in name or '\\' in name or '..' in name:
-        return f'名称不合法: {name}'
+        return '名称不合法 (不能含 / \\ 或 ..)'
     if name.startswith('.') or name in ('.', '..'):
-        return f'名称不合法: {name}'
+        return '名称不合法 (不能以 . 开头)'
     if any(c in name for c in ':*?"<>|'):
-        return f'名称含非法字符: {name}'
+        return '名称含非法字符 (: * ? " < > |)'
     return ''
 
 
 def check_target(target: dict) -> str:
-    """校验上传目录配置; 返回错误信息, 空串表示可用。"""
+    """校验上传目录配置; 返回错误信息, 空串表示可用 (会发进群, 所以不带服务器路径)。"""
     key = (target or {}).get('key') or '上传'
     path = (target or {}).get('path') or ''
     if not path:
         return f'{key} 上传目录未配置, 请在后台面板「LGTBot 自动部署」页填写'
-    if not os.path.isabs(path):
-        return f'{key} 上传目录必须是绝对路径: {path}'
-    if not os.path.isdir(path):
-        return f'{key} 上传目录不存在或不是目录: {path}'
+    if not os.path.isabs(path) or not os.path.isdir(path):
+        return f'{key} 上传目录配置有误 (须是已存在的绝对路径), 请管理员在后台面板检查'
     return ''
 
 
@@ -69,11 +70,16 @@ def _inside(base_real: str, path_real: str) -> bool:
 
 
 def _out(ok: bool, name: str, error: str = '', dest: str = '', backup: str = '',
-         note: str = '', replaced: bool = False, backup_temp: bool = False) -> dict:
+         note: str = '', replaced: bool = False, backup_temp: bool = False,
+         detail: str = '') -> dict:
     """deploy_* 的统一返回。``replaced`` = 落地前这里本来就有东西 (回滚时据此决定
-    是放回旧版本还是只撤掉新内容); ``backup_temp`` = 备份只为回滚而留, 编译成功后要删。"""
+    是放回旧版本还是只撤掉新内容); ``backup_temp`` = 备份只为回滚而留, 编译成功后要删。
+
+    ``error`` 会被原样发进群, 只放固定文案 —— 不带目录名 / 文件名 (上传者起的) 与系统
+    报错原文 (里面有服务器路径); 那些放 ``detail``, 只进记录与面板。"""
     return {'ok': ok, 'error': error, 'dest': dest, 'name': name, 'backup': backup,
-            'note': note, 'replaced': replaced, 'backup_temp': backup_temp}
+            'note': note, 'replaced': replaced, 'backup_temp': backup_temp,
+            'detail': detail or error}
 
 
 def reload_triggers(path: str) -> list:
@@ -91,6 +97,12 @@ def reload_triggers(path: str) -> list:
             if f.endswith('.py') and not f.startswith('_'):
                 out.append(os.path.relpath(os.path.join(d, f), path).replace(os.sep, '/'))
     return sorted(out)
+
+
+def _write_failed(restored: bool) -> str:
+    """落地写盘失败时群里的说法 (报错原文带服务器路径, 只进明细)。"""
+    return ('部署失败 (服务器写盘出错), 已恢复原状' if restored
+            else '部署失败 (服务器写盘出错), 且没能恢复原状, 请管理员检查服务器')
 
 
 def _stash(src: str, rel: str) -> str:
@@ -126,21 +138,24 @@ def deploy_archive(staging: str, root: str, base_name: str, target: dict, cfg: d
     base_real = os.path.realpath(target['path'])
     dest = os.path.realpath(os.path.join(base_real, base_name))
     if os.path.dirname(dest) != base_real:
-        return _out(False, base_name, f'目标路径越界: {base_name}')
+        return _out(False, base_name, '目标路径越界', detail=f'目标路径越界: {base_name}')
 
     replaced = os.path.exists(dest)
     backup = ''
     if replaced:
         hits = reload_triggers(dest) if os.path.isdir(dest) else []
         if hits:
+            # 文件名不进群: 那是早先上传者起的名字 (明细里有, 管理员在面板看)
             shown = '、'.join(hits[:5]) + (f' 等 {len(hits)} 个' if len(hits) > 5 else '')
-            return _out(False, base_name,
-                        f'服务器上的旧版本里有 .py 文件 ({shown}), 替换时要挪进插件的备份目录, '
-                        '会触发框架热重载、打断这次部署; 请管理员先在服务器上删掉这些文件', dest)
+            why = ('替换时要挪进插件的备份目录, 会触发框架热重载、打断这次部署; '
+                   '请管理员先在服务器上删掉这些文件')
+            return _out(False, base_name, f'服务器上的旧版本里有 {len(hits)} 个 .py 文件, {why}',
+                        dest, detail=f'服务器上的旧版本里有 .py 文件 ({shown}), {why}')
         try:
             backup = _stash(dest, base_name)
         except OSError as e:
-            return _out(False, base_name, f'替换旧目录失败: {e}', dest)
+            return _out(False, base_name, '替换旧目录失败 (服务器写盘出错)', dest,
+                        detail=f'替换旧目录失败: {e}')
     temp = replaced and not cfg.get('keep_replaced_backup', True)
 
     note = ''
@@ -160,7 +175,8 @@ def deploy_archive(staging: str, root: str, base_name: str, target: dict, cfg: d
             err = f'部署失败: {e} / {e2}'
             if not undo['ok']:
                 err += f'; 恢复原状也失败了: {undo["error"]}'
-            return _out(False, base_name, err, dest, '' if undo['ok'] else backup)
+            return _out(False, base_name, _write_failed(undo['ok']), dest,
+                        '' if undo['ok'] else backup, detail=err)
     return _out(True, base_name, dest=dest, backup=backup, note=note,
                 replaced=replaced, backup_temp=temp)
 
@@ -178,23 +194,26 @@ def deploy_single(data: bytes, filename: str, folder: str, target: dict, cfg: di
     base_real = os.path.realpath(target['path'])
     folder_real = os.path.realpath(os.path.join(base_real, folder))
     if os.path.dirname(folder_real) != base_real:
-        return _out(False, folder, f'目标路径越界: {folder}')
+        return _out(False, folder, '目标路径越界', detail=f'目标路径越界: {folder}')
     if not os.path.isdir(folder_real):
-        return _out(False, folder, f'目标下不存在文件夹「{folder}」, 请检查文件夹名称')
+        return _out(False, folder, '目标下不存在这个文件夹, 请检查文件夹名称',
+                    detail=f'目标下不存在文件夹「{folder}」')
 
     dest = os.path.realpath(os.path.join(folder_real, filename))
     if not _inside(folder_real, dest) or os.path.dirname(dest) != folder_real:
-        return _out(False, folder, f'目标路径越界: {filename}')
+        return _out(False, folder, '目标路径越界', detail=f'目标路径越界: {filename}')
 
     replaced = os.path.exists(dest)
     backup, note = '', ''
     if replaced:
         if os.path.isdir(dest):
-            return _out(False, folder, f'目标下已存在同名文件夹「{filename}」', dest)
+            return _out(False, folder, '目标下已存在与这个文件同名的文件夹', dest,
+                        detail=f'目标下已存在同名文件夹「{filename}」')
         try:
             backup = _stash(dest, os.path.join(folder, filename))
         except OSError as e:
-            return _out(False, folder, f'替换旧文件失败: {e}', dest)
+            return _out(False, folder, '替换旧文件失败 (服务器写盘出错)', dest,
+                        detail=f'替换旧文件失败: {e}')
         note = '（已替换同名文件）'
     temp = replaced and not cfg.get('keep_replaced_backup', True)
     try:
@@ -205,7 +224,8 @@ def deploy_single(data: bytes, filename: str, folder: str, target: dict, cfg: di
         err = f'写入失败: {e}'
         if not undo['ok']:
             err += f'; 恢复原状也失败了: {undo["error"]}'
-        return _out(False, folder, err, dest, '' if undo['ok'] else backup)
+        return _out(False, folder, _write_failed(undo['ok']), dest,
+                    '' if undo['ok'] else backup, detail=err)
     return _out(True, folder, dest=dest, backup=backup, note=note,
                 replaced=replaced, backup_temp=temp)
 
@@ -384,7 +404,7 @@ def deploy_pending(pending: str, game: str, folder: str, target: dict, cfg: dict
             with open(path, 'rb') as f:
                 data = f.read()
         except OSError as e:
-            return _out(False, folder, f'读取暂存失败: {e}')
+            return _out(False, folder, '读取暂存失败 (服务器读盘出错)', detail=f'读取暂存失败: {e}')
         res = deploy_single(data, os.path.basename(path), folder, target, cfg)
         if res['ok']:
             with contextlib.suppress(OSError):

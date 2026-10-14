@@ -16,6 +16,8 @@ force 跳过两样: **内容审核**与 **sha256 查重**。前者是它的本�
 force 由主人本人发起, 完成后不再 @ 通知部署人员。
 
 设计要点:
+  · **群消息里绝不出现用户输入** (插件目录 CLAUDE.md): 文件名、文件夹名、包内路径、
+    昵称、模型输出、报错原文都不进群, 详见「结论输出」一节开头。网页报告与后台照常展示。
   · 指令**所有人可执行**, 但只在 config.allowed_groups 列出的群里生效;
     其它群一律静默 (只记日志), 避免把提示刷到无关群。
   · 收到文件后**先回一条确认消息**再进入审核 —— 让上传者立刻知道服务在线;
@@ -25,7 +27,7 @@ force 由主人本人发起, 完成后不再 @ 通知部署人员。
     (不占主动消息额度), 失败再退主动消息。
   · 任何一步失败都写记录 + 在群里给结论, 且**无论结果如何都 @ 部署人员**。
   · 同时只处理一个上传任务 (解压 / 审核都吃内存与带宽), 排队请求直接拒绝。
-  · 新游戏编译成功后自动请求 LGTBot 计划重启 (自动模式, 维护原因「新游戏《X》」),
+  · 新游戏编译成功后自动请求 LGTBot 计划重启 (自动模式, 维护原因固定「新游戏上线」),
     请求成功即不再 @ 开发者 —— 对局清空后由 LGTBot 自行重启, 本插件不跟踪;
     只有请求失败才 @ 开发者手动安排。老游戏更新走热更新, 不请求重启也不 @ 开发者。
   · 编译没成就把 games/ 恢复成部署前的样子 (见 _settle): LGTBot 的 CMake 会扫 games/
@@ -85,7 +87,6 @@ def usage() -> str:
     lines.append('🔸不能带 .py 文件与以 . 开头的隐藏文件 (开发脚本请留在本地)')
     lines.append('🔸rule.md 需有原作标注 (改编需注明「改编自 X」)')
     lines.append('🔸新游戏上传成功后目录自动绑定上传者, 此后仅绑定用户可更新该目录')
-    lines.append('🔸审核通过后自动请求编译并回报结果')
     lines.append('🔸内容完全相同的文件会被直接拒收; 只是编译失败请用 /compile 重编')
     return '\n'.join(lines)
 
@@ -161,7 +162,7 @@ async def handle(event, argline: str, force: bool = False) -> bool:
     if folder:
         name_err = deploy.bad_name(folder)
         if name_err:
-            await _send(event, f'❌ {name_err}')
+            await _send(event, f'❌ 文件夹{name_err}')
             return False
 
     ref = quoted.extract_file_ref(event, allow_any=True)
@@ -173,22 +174,25 @@ async def handle(event, argline: str, force: bool = False) -> bool:
         return False
 
     fname = store.safe_filename(ref.get('filename'))
+    # 以下拒收一律**不带文件名**: 文件名是上传者起的, bot 原样发出去, 违规的就是 bot 自己
+    # (见插件目录 CLAUDE.md)。上传者知道自己引用的是哪个文件, 用不着复述。
+    #
     # 隐藏文件与压缩包预检 (archive._reject_hidden) 同一条规则, 只是单文件光看文件名就能判 —— 所以拦在这里, 连下载都省了。
     # 此前只有文件夹名与压缩包基名过 bad_name,单文件自己的名字没人管, 引用一个 .DS_Store 就能把它写进游戏目录。
     if fname.startswith('.'):
-        await _send(event, f'❌ 不接受以 . 开头的隐藏文件「{fname}」\n'
+        await _send(event, '❌ 不接受以 . 开头的隐藏文件\n'
                            '这类文件 (.DS_Store、.gitignore 等) 不应进入游戏目录, '
                            '请确认引用的是正确的文件')
         return False
     # .py 同理 (理由见 archive._reject_scripts): 而且必须拦在下载之前 —— 留档原件会写成
     # data/archives/<记录号>_<文件名>, 以 .py 结尾, 一落盘就触发本插件热重载
     if archive.is_script(fname):
-        await _send(event, f'❌ 不接受 .py 文件「{fname}」\n'
+        await _send(event, '❌ 不接受 .py 文件\n'
                            '游戏目录用不到 Python 脚本, 开发用的脚本请留在本地')
         return False
     is_archive = quoted.archive_ext(fname) in quoted.ARCHIVE_EXTS
     if not folder and not is_archive:
-        await _send(event, f'❌ 引用的文件「{fname}」不是支持的压缩包\n'
+        await _send(event, '❌ 引用的文件不是支持的压缩包\n'
                            '压缩包支持 zip / tar.gz / tar.bz2 / tar.xz；\n'
                            '如需上传单文件, 请指定目标文件夹: /upload <文件夹名>')
         return False
@@ -207,14 +211,14 @@ async def handle(event, argline: str, force: bool = False) -> bool:
     # 否则别人抢先传一个同名新游戏, 那份暂存就被顶掉了
     held = not exists and bool(store.pending_of(store.last_game_record(game)))
     if (exists or held) and not force:
+        # 不带目录名 (取自上传者起的文件名), 也不带绑定人的昵称 —— 同样是用户可控的文本
         owner = store.perm_get(game)
         if owner is None:
-            await _send(event, f'❌ 权限不足: 目录「{game}」尚未绑定更新权限\n'
+            await _send(event, '❌ 权限不足: 这个游戏目录尚未绑定更新权限\n'
                                '已有游戏目录仅绑定用户可更新, 请联系管理员在后台「权限管理」页绑定')
             return False
         if owner.get('user_id') != (event.user_id or ''):
-            shown = owner.get('username') or (owner.get('user_id') or '')[:8] + '…'
-            await _send(event, f'❌ 权限不足: 目录「{game}」已绑定给 {shown}\n'
+            await _send(event, '❌ 权限不足: 这个游戏目录已绑定给其他用户\n'
                                '仅绑定用户可更新该目录, 如需变更请联系管理员')
             return False
     is_new = (not folder) and not exists
@@ -307,7 +311,8 @@ async def _run(event, cfg: dict, ref: dict, target: dict, folder: str,
                      context={'record': rid, 'group_id': event.group_id})
         record.update(stage='error', error=f'{type(e).__name__}: {e}')
         _persist(record)
-        await _send(event, _fail_text(record, cfg, '处理过程出现异常'))
+        # 异常原文只进记录: 里面可能有文件名、包内路径、服务器路径
+        await _send(event, _fail_text(record, cfg, '处理过程出现异常', reason=_INTERNAL))
     finally:
         store.cleanup_staging(rid)
         _busy = False
@@ -331,20 +336,22 @@ async def _pipeline(event, cfg: dict, ref: dict, record: dict, target: dict, fol
     fname = record['filename']
     single = bool(folder)
 
-    # 1) 先回确认, 让上传者知道服务在线 (不含审核细节)
-    where = f'{target["key"]}/{folder}' if single else target['key']
-    await _send(event, f'📥 已收到文件「{fname}」→ {where}, 正在处理, 请稍候…')
+    # 1) 先回确认, 让上传者知道服务在线 (不含审核细节, 也不复述文件名 —— 见 _file_line)
+    await _send(event, f'📥 已收到{_kind(record)} → {_where(record)}, 正在处理, 请稍候…')
 
     # 2) 下载
     ext = quoted.archive_ext(fname)
     if not single and ext in quoted.UNSUPPORTED_EXTS:
+        # ext 只会是 UNSUPPORTED_EXTS 里的固定几个, 不是上传者写的字
         record.update(stage='download', error=f'暂不支持 {ext}, 请改用 zip 或 tar.gz 重新打包')
-        return await _finish_fail(event, cfg, record, '压缩格式不支持')
+        return await _finish_fail(event, cfg, record, '压缩格式不支持', reason=record['error'])
     max_bytes = int(cfg['max_archive_mb']) * 1024 * 1024
     data, err = await quoted.download(ref['url'], max_bytes, int(cfg['download_timeout']))
     if data is None:
         record.update(stage='download', error=err)
-        return await _finish_fail(event, cfg, record, '文件下载失败')
+        # 下载异常的原文可能带文件链接 (链接里有文件名), 群里只说是异常; 状态码 / 超限照报
+        reason = '下载异常 (网络或文件链接问题)' if err.startswith('下载异常') else err
+        return await _finish_fail(event, cfg, record, '文件下载失败', reason=reason)
     record['size'] = len(data)
 
     # 2.5) 内容查重: 字节完全一致的包直接拒收, 不重复占审核额度与编译时间。
@@ -363,10 +370,11 @@ async def _pipeline(event, cfg: dict, ref: dict, record: dict, target: dict, fol
                             f'旧结论「{_record_outcome(dup)}」')
         # 上次那份报告还在就一并递过去: 内容一个字节没改, 上次为什么没过原样适用
         prev = report.existing_link(cfg, dup, report.LINK_TEXT_PREV)
-        # 不 @ 部署人员: 重传同一个包纯属上传者操作失误, 没有任何要人工介入的地方
+        # 不 @ 部署人员: 重传同一个包纯属上传者操作失误, 没有任何要人工介入的地方。
+        # 原因里只有记录号与固定文案 (_record_outcome 只用固定标签), 可以照发
         return await _finish_fail(event, cfg, record, '重复上传, 已拒收',
                                   suffix=_dup_tip(dup), extra=[prev] if prev else [],
-                                  notify=False)
+                                  notify=False, reason=record['error'])
 
     if cfg.get('keep_archive'):
         record['archive_file'] = store.save_archive(rid, fname, data)
@@ -387,27 +395,29 @@ async def _pipeline(event, cfg: dict, ref: dict, record: dict, target: dict, fol
         store.cleanup_staging(rid)
         try:
             info = await asyncio.to_thread(archive.extract, data, fname, staging, limits)
+        # 成员名是上传者起的: 明细 (str(e)) 只进记录, 群里用 e.public (见 archive.ArchiveError)
         except archive.HiddenMemberError as e:
             # 必须排在 ArchiveError 之前 (它是子类)。这类不 @ 开发者: 打包时没清干净
             # 而已, 上传者重打一个就好 —— 不像路径穿越那样需要有人看一眼
             record.update(stage='hidden', error=str(e))
             return await _finish_fail(
-                event, cfg, record, '压缩包含隐藏文件, 已拒收', notify=False,
+                event, cfg, record, '压缩包含隐藏文件, 已拒收', notify=False, reason=e.public,
                 suffix='请删掉这些以 . 开头的文件/目录后重新打包上传 '
                        '(常见的是 .git、.DS_Store、.vscode)')
         except archive.ScriptMemberError as e:
             # 同样排在 ArchiveError 之前、同样不 @ 开发者: 删掉重打就好
             record.update(stage='script', error=str(e))
             return await _finish_fail(
-                event, cfg, record, '压缩包含 .py 文件, 已拒收', notify=False,
+                event, cfg, record, '压缩包含 .py 文件, 已拒收', notify=False, reason=e.public,
                 suffix='请删掉这些 .py 文件后重新打包上传 (游戏目录用不到 Python 脚本, '
                        '生成素材之类的开发脚本请留在本地)')
         except archive.ArchiveError as e:
             record.update(stage='extract', error=str(e))
-            return await _finish_fail(event, cfg, record, '压缩包校验失败')
+            return await _finish_fail(event, cfg, record, '压缩包校验失败', reason=e.public)
         except Exception as e:  # noqa: BLE001
             record.update(stage='extract', error=f'{type(e).__name__}: {e}')
-            return await _finish_fail(event, cfg, record, '解压失败')
+            return await _finish_fail(event, cfg, record, '解压失败',
+                                      reason='压缩包损坏或格式不受支持')
         record['total_size'] = info['total_size']
         record['root'] = info['root']
 
@@ -415,7 +425,7 @@ async def _pipeline(event, cfg: dict, ref: dict, record: dict, target: dict, fol
         pkg = await asyncio.to_thread(archive.collect, staging, limits)
         if not pkg['tree']:
             record.update(stage='extract', error='压缩包内没有任何文件')
-            return await _finish_fail(event, cfg, record, '压缩包为空')
+            return await _finish_fail(event, cfg, record, '压缩包为空', reason=record['error'])
 
     record['file_count'] = len(pkg['tree'])
     record['rule_files'] = pkg['rule_files']
@@ -424,8 +434,9 @@ async def _pipeline(event, cfg: dict, ref: dict, record: dict, target: dict, fol
     if not single:
         missing = archive.missing_required(pkg['tree'], cfg.get('required_files') or [])
         if missing:
+            # missing 只会是面板配的必需文件名, 不是上传者写的字, 可以点名
             record.update(stage='integrity', error='缺少必需文件: ' + '、'.join(missing))
-            return await _finish_fail(event, cfg, record, '压缩包不完整',
+            return await _finish_fail(event, cfg, record, '压缩包不完整', reason=record['error'],
                                       suffix='请补齐上述文件后重新打包上传')
 
     # 6) 审核 (force 与「面板关闭审核」都跳过, 但记录里区分开)
@@ -447,7 +458,8 @@ async def _pipeline(event, cfg: dict, ref: dict, record: dict, target: dict, fol
         ov = pkg['oversize']
         record.update(stage='review', error=_oversize_error(ov))
         return await _finish_fail(event, cfg, record, '送审文本超出上限, 未送审',
-                                  suffix=_OVERSIZE_TIP, extra=_oversize_lines(ov))
+                                  reason=_oversize_reason(ov), suffix=_OVERSIZE_TIP,
+                                  extra=_oversize_lines(ov))
     meta = {'filename': fname, 'size': record['size'], 'total_size': info['total_size'],
             'mode': record['mode'], 'target': target['key'], 'folder': folder}
     result = await _review_with_retry(event, cfg, pkg, meta, record)
@@ -504,7 +516,7 @@ def _retry_text(record: dict, result: dict, attempt: int) -> str:
     return '\n'.join([
         f'⚠️ 审核服务异常 ({review.status_text(result)}), '
         f'第 {attempt}/{_REVIEW_ATTEMPTS} 次尝试失败',
-        f'📦 文件: {record["filename"]} ({_size_mb(record["size"])}) → {_where(record)}',
+        _file_line(record),
         f''
         f'⏳ {_REVIEW_RETRY_WAIT} 秒后自动重试, 请勿重复上传…',
     ])
@@ -551,33 +563,46 @@ def _size_mb(n: int) -> str:
     return f'{(n or 0) / 1048576:.2f} MB'
 
 
-def _game_label(record: dict, game: str) -> str:
-    """群消息里的游戏标识: 有中文名则「中文名(目录名)」, 否则只用目录名。
+# ---- 群消息里**绝不出现用户输入** (见插件目录 CLAUDE.md) ----
+# 文件名、文件夹名 / 目录名 (取自文件名)、指令参数、包内成员路径、昵称、模型输出 (含
+# game_name 与 findings 的 target)、报错原文 (里面有路径与文件名) 一概不进群: bot 原样
+# 发出去, 违规的就是 bot 自己。群里只放固定文案、数字、记录号、面板配置的文字 (目标 key、
+# 必需文件清单) 与固定标签; 要看细节的走网页报告与后台记录, 那边可以照常展示。
 
-    中文名来自审核结果 (或本地解析 mygame.cc), 已在 review._clean_display 里去掉
-    换行与 ``<> 「」`` —— 不会被用来伪造 @ 或伪造多行消息。
-    """
-    name = (record.get('game_name') or '').strip()
-    return f'{name}({game})' if name else game
+_INTERNAL = '插件内部异常, 详情见后台记录'
+
+
+def _kind(record: dict) -> str:
+    return '单文件' if record.get('mode') == 'file' else '压缩包'
 
 
 def _where(record: dict) -> str:
-    """结论消息里的目标描述: 目标 key (+ 文件夹名)。"""
-    return f'{record["target"]}/{record["folder"]}' if record['folder'] else record['target']
+    """结论消息里的目标描述: 只有目标 key (面板配置的), 不带文件夹名 (上传者起的)。"""
+    return f'{record["target"]} 下的指定文件夹' if record.get('folder') else record['target']
+
+
+def _file_line(record: dict) -> str:
+    """群消息里「📦」那一行: 类型 + 大小 + 去向, 不复述文件名 —— 上传者知道自己传的是哪个。"""
+    size = f' ({_size_mb(record["size"])})' if record.get('size') else ''
+    return f'📦 {_kind(record)}{size} → {_where(record)}'
 
 
 def _fail_text(record: dict, cfg: dict, title: str, suffix: str = '',
-               extra: list | None = None, notify: bool = True) -> str:
+               extra: list | None = None, notify: bool = True, reason: str = '') -> str:
     """失败结论: 只给原因与记录号, 不含任何模型输出。``extra`` 是补充明细行。
+
+    ``reason`` 必须由调用方给出、且只含固定文案 —— 这里**不读** record['error']: 那是
+    给后台的明细, 常带文件名、包内路径与报错原文 (见本段开头)。没给就不写原因行。
 
     ``notify=False`` 不 @ 部署人员 —— 用于上传者自己就能处理完、开发者不需要
     知道的情形 (如重复上传拒收: 内容一个字节没改, 没有任何要人工介入的地方)。
     """
     lines = [
         f'⚠️ {title}, 需人工处理' if not suffix else f'⚠️ {title}',
-        f'📦 文件: {record["filename"]} → {_where(record)}',
-        f'❗ 原因: {record["error"] or "未知错误"}',
+        _file_line(record),
     ]
+    if reason:
+        lines.append(f'❗ 原因: {reason}')
     lines += extra or []
     lines.append(f'🆔 记录: {record["id"]}')
     if suffix:
@@ -589,9 +614,9 @@ def _fail_text(record: dict, cfg: dict, title: str, suffix: str = '',
 
 
 async def _finish_fail(event, cfg: dict, record: dict, title: str, suffix: str = '',
-                       extra: list | None = None, notify: bool = True):
+                       extra: list | None = None, notify: bool = True, reason: str = ''):
     _persist(record)
-    await _send(event, _fail_text(record, cfg, title, suffix, extra, notify))
+    await _send(event, _fail_text(record, cfg, title, suffix, extra, notify, reason))
 
 
 # ==================== 送审文本超限 ====================
@@ -600,25 +625,48 @@ _OVERSIZE_TIP = '请精简过大的文本文件后重新上传 (词库 / 题库�
 
 
 def _oversize_error(ov: dict) -> str:
+    """后台明细 (带触顶的文件路径)。群里用 _oversize_reason。"""
     return (f'包内文本总量超过审核上限 {ov["budget"]} 字 '
             f'(共 {ov["text_files"]} 个文本文件, {_size_mb(ov["text_bytes"])}), '
             f'读到「{ov["hit"]}」时触顶。本次未送审')
 
 
+def _oversize_reason(ov: dict) -> str:
+    return (f'包内文本总量超过审核上限 {ov["budget"]} 字 '
+            f'(共 {ov["text_files"]} 个文本文件, {_size_mb(ov["text_bytes"])}), 本次未送审')
+
+
 def _oversize_lines(ov: dict) -> list:
-    """群消息里的超限明细: 最大的几个文本文件 (让上传者知道该精简谁)。"""
+    """群消息里的超限明细: 最大的几个文本文件有多大 (让上传者知道该精简谁)。
+
+    路径是上传者起的, 不进群; 只有常见的固定文件名 (_public_name) 才点名。"""
     if not ov.get('largest'):
         return []
-    return ['📄 最大的文本文件:'] + [
-        f'{i}. {f["path"]} ({_size_mb(f["size"])})'
-        for i, f in enumerate(ov['largest'], 1)]
+    return ['📄 最大的几个文本文件: ' + '、'.join(
+        f'{_public_name(f["path"]) or "其他文件"} {_size_mb(f["size"])}' for f in ov['largest'])]
+
+
+# 群消息里可以点名的文件名: LGTBot 游戏的固定文件 (本插件写的字, 不是上传者起的),
+# 再加面板配的必需文件清单。其余一律说「其他文件」—— 具体是哪个看网页报告。
+_KNOWN_FILES = ('mygame.cc', 'rule.md', 'board.h', 'achievements.h', 'options.h',
+                'option.cmake', 'unittest.cc', 'icon.png')
+
+
+def _public_name(path: str) -> str:
+    """路径的文件名若在可点名的固定词表里就返回它, 否则返回空串 (目录部分一概不要)。"""
+    name = str(path or '').replace('\\', '/').rstrip('/').rsplit('/', 1)[-1]
+    known = set(_KNOWN_FILES) | set(config.all_config().get('required_files') or [])
+    return name if name in known else ''
 
 
 _MAX_SHOWN_FINDINGS = 8
 
 
-def _finding_lines(record: dict) -> list:
+def _finding_lines(record: dict, public: bool = False) -> list:
     """违规位置列表 (只含分类 + 文件 + 行号, 绝不含违规内容原文)。
+
+    ``public=True`` 是群消息用的: 文件只认固定文件名 (_public_name), 其余说「其他文件」——
+    target 是模型报的包内路径, 路径本身就是上传者起的名字。留档 (默认) 照写完整路径。
 
     **不要往这里加 finding['reason']**。那是模型对不可信上传物的复述, 可能夹带
     违规原文、伪造的 <@openid>、伪造的多行消息 —— 让 bot 把它播进群, 等于本插件
@@ -632,8 +680,10 @@ def _finding_lines(record: dict) -> list:
         if f.get('suspect'):
             label += '·疑似'
         loc = f.get('target') or '(未标注位置)'
+        if public:
+            loc = _public_name(loc) or '其他文件'
         if f.get('line'):
-            loc += f':{f["line"]}'
+            loc += f':{int(f["line"])}'
         lines.append(f'{i}. [{label}] {loc}')
     if len(findings) > _MAX_SHOWN_FINDINGS:
         lines.append(f'…… 其余 {len(findings) - _MAX_SHOWN_FINDINGS} 处见后台留档')
@@ -652,7 +702,7 @@ async def _finish_reject(event, cfg: dict, record: dict, result: dict):
         attempts = result.get('attempts', 1)
         lines = [
             f'⚠️ 审核服务异常 ({review.status_text(result)}), 需人工处理',
-            f'📦 文件: {record["filename"]} ({_size_mb(record["size"])}) → {_where(record)}',
+            _file_line(record),
         ]
         if attempts > 1:
             lines.insert(1, f'🔁 已尝试 {attempts} 次 (含 {attempts - 1} 次重试), 重试次数耗尽')
@@ -661,10 +711,10 @@ async def _finish_reject(event, cfg: dict, record: dict, result: dict):
         suspect_only = bool(result['findings']) and all(f.get('suspect') for f in result['findings'])
         lines = [
             '❌ 审核未通过 (疑似违规, 需人工复核)' if suspect_only else '❌ 审核未通过',
-            f'📦 文件: {record["filename"]} ({_size_mb(record["size"])}) → {_where(record)}',
+            _file_line(record),
             f'🚫 未通过分类: {review.labels(result["categories"])}',
         ]
-        floc = _finding_lines(record)
+        floc = _finding_lines(record, public=True)
         if floc:
             lines.append('📍 违规位置:')
             lines += floc
@@ -750,15 +800,15 @@ def _land(record: dict, data: bytes, staging: str, info: dict, target: dict, fol
 
 async def _finish_deploy(event, cfg: dict, record: dict, data: bytes, staging: str,
                          info: dict, target: dict, folder: str, skip_reason: str = ''):
-    fname = record['filename']
     res = await _uninterrupted(_land, record, data, staging, info, target, folder, cfg)
 
     if not res['ok']:
-        record.update(stage='deploy', error=res['error'])
+        # res['error'] 是 deploy 给的固定说法; 带路径与报错原文的 detail 只进记录
+        record.update(stage='deploy', error=res.get('detail') or res['error'])
         _persist(record)
         lines = [
             _DEPLOY_FAIL_HEAD.get(skip_reason, _DEPLOY_FAIL_HEAD['']),
-            f'📦 文件: {fname} → {_where(record)}',
+            _file_line(record),
             f'❗ 原因: {res["error"]}',
             f'🆔 记录: {record["id"]}',
         ]
@@ -770,20 +820,18 @@ async def _finish_deploy(event, cfg: dict, record: dict, data: bytes, staging: s
     game = folder if folder else res['name']
 
     # ---- 部署结果消息 (含「已请求编译」提示) ----
+    # 不复述文件名 / 目录名 / 备份名 (都带上传者起的名字), 也不报 game_name —— 那是模型
+    # 回显的 (本地解析兜底), 两样都不能进群; 绑定人也只说「上传者」, 不报昵称
     head = _DEPLOY_HEAD.get(skip_reason, _DEPLOY_HEAD[''])
-    lines = [head, f'📦 文件: {fname} ({_size_mb(record["size"])})']
-    if folder:
-        lines.append(f'📂 位置: {record["target"]} / {folder}/{fname}{res["note"]}')
-    else:
-        lines.append(f'📂 目录: {record["target"]} / {res["name"]}/  '
-                     f'({record.get("file_count", 0)} 个文件){res["note"]}')
+    lines = [head, _file_line(record) + res['note']]
+    if not folder:
+        lines.append(f'📂 已解压到 {record["target"]} 下的同名文件夹 '
+                     f'({record.get("file_count", 0)} 个文件)')
     # 面板没开备份时这份只为回滚临时留着, 编译成功就删 —— 不当成「已备份」报出去
     if res['backup'] and not res['backup_temp']:
-        lines.append(f'♻️ 旧内容已备份: {os.path.basename(res["backup"])}')
-    if record.get('game_name'):
-        lines.append(f'🎮 游戏名称: {record["game_name"]}')
+        lines.append('♻️ 旧内容已备份')
     if record.get('perm_bound'):
-        lines.append(f'🔗 目录权限已绑定: {record["username"] or record["user_id"]}')
+        lines.append('🔗 目录权限已绑定给上传者')
     lines.append(f'🆔 记录: {record["id"]}')
 
     if not cfg.get('compile_enabled', True):
@@ -840,8 +888,7 @@ async def _report_compile(event, cfg: dict, record: dict, result: dict, game: st
     # 老游戏更新走热更新, 不需要重启, 也就不请求。
     restart = None
     if result.get('ok') and record.get('is_new'):
-        restart = await compilemod.request_planned_restart(
-            cfg, f'新游戏《{_restart_game_name(record, game)}》')
+        restart = await compilemod.request_planned_restart(cfg, _RESTART_REASON)
         record['restart'] = {k: restart.get(k) for k in _RESTART_RECORD_KEYS}
         notes.append('## 计划重启请求\n' + compilemod.describe_restart(restart))
 
@@ -864,7 +911,11 @@ async def _report_compile(event, cfg: dict, record: dict, result: dict, game: st
     await _send(event, _compile_text(cfg, record, result, game, restart, link), active=True)
 
 
-def _fail_next_step(result: dict, game: str, record: dict) -> str:
+# 重编指令的写法: 目录名是上传者起的, 不替他填, 只给格式 (与 /upload help 一致)
+_COMPILE_CMD = '/compile <文件夹名>'
+
+
+def _fail_next_step(result: dict, record: dict) -> str:
     """编译没成时的出路 —— 按失败性质二选一, 不把两条路一起摆出来。
 
     默认路是**改完重传**: 绝大多数编译失败就是代码编不过, 拿 /compile 去重编一份
@@ -875,7 +926,8 @@ def _fail_next_step(result: dict, game: str, record: dict) -> str:
     if compilemod.is_transient(result):
         kept = ('新代码已暂存' if (record.get('rollback') or {}).get('pending')
                 else '源码已在服务器上')
-        return f'> 💡 属于临时问题 (编译进程被占用/服务未就绪)，{kept}，稍后发 /compile {game} 重试即可，无需重传'
+        return (f'> 💡 属于临时问题 (编译进程被占用/服务未就绪)，{kept}，'
+                f'稍后发 {_COMPILE_CMD} 重试即可，无需重传')
     return '> 💡 编译器报错，代码本身无法编译，请按错误日志修改源码后重新 /upload 上传'
 
 
@@ -1000,29 +1052,34 @@ def _cancel_text(cfg: dict, record: dict, game: str) -> str:
     还没落地的 (stage='cancelled') 让他重新上传; 已经落地或本来就是 /compile 的,
     新代码在暂存 (或还在服务器上), /compile 就能接着编。
     """
-    lines = ['⚠️ 处理被中断 (插件重载或机器人重启), 这次没有完成',
-             f'📦 文件: {record["filename"]} → {_where(record)}']
+    lines = ['⚠️ 处理被中断 (插件重载或机器人重启), 这次没有完成', _file_line(record)]
     lines += _rollback_lines(record)
     lines.append(f'🆔 记录: {record["id"]}')
     if record.get('stage') == 'cancelled':
         lines.append('> 💡 请稍后重新上传')
     else:
-        lines.append(f'> 💡 稍后发 /compile {game} 重试即可，无需重传')
+        lines.append(f'> 💡 稍后发 {_COMPILE_CMD} 重试即可，无需重传')
     at = _mentions(cfg, record)
     if at:
         lines.append(at + ' 请知悉')
     return '\n'.join(lines)
 
 
-def _compile_reason(result: dict) -> str:
+def _compile_reason(result: dict, game: str) -> str:
     """编译失败原因 (群消息用)。
 
     只取编译 API 的 ``error`` 字段 —— 它是 API 自己的固定文案 (见 build_api.py 的
     ``_err`` 调用), **不含编译器输出**; 编译器输出在单独的 ``log_tail`` 里, 那份掺着
     上传者的源码, 只进留档不进群。这里仍走一遍展示净化: 去控制字符与换行 (防伪造
     多行消息)、去 ``<>`` (防伪造 @ 全体), 再遮蔽 IP:端口 (与报告页共用 review.mask_addr)。
+
+    唯一会带用户输入的是目标名 (API 的「target 名称非法: '…'」那句): 目录名取自上传者
+    起的文件名, 替换掉再发。
     """
-    return review._clean_display(review.mask_addr(result.get('error')), 200)
+    text = str(result.get('error') or '')
+    if game:
+        text = text.replace(game, '(目录名)')
+    return review._clean_display(review.mask_addr(text), 200)
 
 
 # ==================== /compile 重新编译 ====================
@@ -1049,29 +1106,29 @@ async def handle_recompile(event, argline: str) -> bool:
     if len(args) != 1:
         await _send(event, '❌ 用法: /compile <文件夹名>\n仅在上次编译失败时可用')
         return False
+    # 目录名是指令参数 (用户输入), 下面的回复一律不复述它, 也不报负责人的昵称
     game = args[0]
     name_err = deploy.bad_name(game)
     if name_err:
-        await _send(event, f'❌ {name_err}')
+        await _send(event, f'❌ 文件夹{name_err}')
         return False
 
     last = store.last_game_record(game)
     if last is None:
-        await _send(event, f'❌ 目录「{game}」没有上传记录, 请先用 /upload 上传')
+        await _send(event, '❌ 这个目录没有上传记录, 请先用 /upload 上传')
         return False
 
     uid = event.user_id or ''
     owner = store.perm_get(game)
     allowed = {last.get('user_id') or ''} | ({owner.get('user_id')} if owner else set())
     if uid not in allowed:
-        shown = (owner or {}).get('username') or last.get('username') or '上次的上传者'
-        await _send(event, f'❌ 权限不足: 目录「{game}」由 {shown} 负责, 仅其本人可重新编译')
+        await _send(event, '❌ 权限不足: 这个目录由其他用户负责, 仅其本人可重新编译')
         return False
 
     comp = last.get('compile') or {}
     st = comp.get('status')
     if comp.get('ok'):
-        await _send(event, f'❌ 目录「{game}」上次编译已成功 (记录 {last.get("id")}), 无需重试\n'
+        await _send(event, f'❌ 这个目录上次编译已成功 (记录 {last.get("id")}), 无需重试\n'
                            '如需更新内容请修改后 /upload 重新上传')
         return False
     # 编译器真跑起来并报错 = 代码本身编不过, 重编同一份源码结果不会变 —— 这条指令
@@ -1080,16 +1137,16 @@ async def handle_recompile(event, argline: str) -> bool:
     # 当时就已经撤掉了, 服务器上本来也没有可重编的东西
     if compilemod.needs_reupload(comp):
         if st == 'invalid':
-            await _send(event, f'❌ 目录名「{game}」不被编译 API 接受 (记录 {last.get("id")})\n'
+            await _send(event, f'❌ 目录名不被编译 API 接受 (记录 {last.get("id")})\n'
                                '请改用纯英文目录名 (字母/数字/下划线/连字符) 重新 /upload 上传')
         else:
-            await _send(event, f'❌ 目录「{game}」上次是编译器报错 (记录 {last.get("id")}), '
+            await _send(event, f'❌ 这个目录上次是编译器报错 (记录 {last.get("id")}), '
                                '重编同一份源码只会得到同样的结果\n'
                                '请按编译日志修改源码后重新 /upload 上传\n'
                                '> 💡 /compile 只适用于编译进程被占用、编译服务未就绪这类临时失败')
         return False
     if (last.get('rollback') or {}).get('pending') and not store.pending_of(last):
-        await _send(event, f'❌ 目录「{game}」暂存的新代码已不在 (记录 {last.get("id")}, '
+        await _send(event, f'❌ 这个目录暂存的新代码已不在 (记录 {last.get("id")}, '
                            '可能已在后台被清理), 无法重新编译\n请联系管理员处理')
         return False
     if not cfg.get('compile_enabled', True):
@@ -1182,10 +1239,11 @@ async def _run_recompile(event, cfg: dict, game: str, last: dict):
             res = await _uninterrupted(_reland, record, held, game, last, cfg)
             if not res['ok']:
                 _persist(record)
-                await _send(event, _fail_text(record, cfg, '暂存的新代码没能放回服务器'), active=True)
+                await _send(event, _fail_text(record, cfg, '暂存的新代码没能放回服务器',
+                                              reason=res['error']), active=True)
                 return
             store.append_review_text(rid, f'已把记录 {last.get("id")} 暂存的新代码放回服务器后再编译')
-        await _send(event, f'🔧 已请求重新编译「{_game_label(record, game)}」'
+        await _send(event, '🔧 已请求重新编译'
                            + ('（新游戏完整编译, 耗时更长）' if record['is_new'] else '')
                            + ', 请耐心等待结果…')
         await _compile_and_report(event, cfg, record, game)
@@ -1201,7 +1259,8 @@ async def _run_recompile(event, cfg: dict, game: str, last: dict):
         report_error(PLUGIN, 'LGTBot自动部署', e, context={'record': rid, 'game': game})
         record.update(error=f'{type(e).__name__}: {e}')
         _persist(record)
-        await _send(event, _fail_text(record, cfg, '重新编译过程出现异常'), active=True)
+        await _send(event, _fail_text(record, cfg, '重新编译过程出现异常', reason=_INTERNAL),
+                    active=True)
     finally:
         _busy = False
 
@@ -1260,7 +1319,7 @@ def _dup_tip(dup: dict) -> str:
     game = _record_game(dup)
     comp = dup.get('compile') or {}
     if dup.get('stage') in ('deployed', 'recompile') and game and compilemod.is_transient(comp):
-        return f'内容没有改动无需重传; 上次是临时性编译失败 —— 直接用 /compile {game} 重试'
+        return f'内容没有改动无需重传; 上次是临时性编译失败 —— 直接用 {_COMPILE_CMD} 重试'
     return '内容没有任何改动就不必重传; 请修改后再上传, 或联系管理员人工处理'
 
 
@@ -1269,12 +1328,10 @@ def _record_game(rec: dict) -> str:
     return str(rec.get('folder') or rec.get('deploy_name') or '')
 
 
-def _restart_game_name(record: dict, game: str) -> str:
-    """计划重启的维护原因里用的游戏名: 优先中文名, 取不到则用目录名 (英文名)。
-
-    与 ``_game_label`` 不同 —— 维护提示是给玩家看的, 不带目录名括号。
-    """
-    return (record.get('game_name') or '').strip() or game
+# 计划重启的维护原因: LGTBot 会把它写进发给玩家的维护提示与通知群消息, 同样是 bot 发出的
+# 话 —— 所以只用固定文案。游戏名 (模型回显的 game_name, 本地解析兜底) 与目录名 (取自
+# 上传者起的文件名) 都不能放进去。
+_RESTART_REASON = '新游戏上线'
 
 
 def _restart_lines(cfg: dict, record: dict, restart: dict | None) -> list:
@@ -1323,11 +1380,11 @@ def _compile_text(cfg: dict, record: dict, result: dict, game: str,
                 left = result.get('active_matches')
             if left is not None:
                 lines.append(f'🎲 当前剩余对局: {left} (重启需等待剩余对局结束)')
-            lines.append(f'{uploader} 新游戏「{_game_label(record, game)}」'
-                         '需等待 bot 重启后才能实装, 请耐心等待')
+            # 不报游戏名 / 目录名 (见 _RESTART_REASON 上方): @ 的就是上传者, 他知道是哪个
+            lines.append(f'{uploader} 新游戏需等待 bot 重启后才能实装, 请耐心等待')
             lines += _restart_lines(cfg, record, restart)
         else:
-            lines.append(f'{uploader} 游戏「{_game_label(record, game)}」已自动热更新, 重新开局即可生效;\n'
+            lines.append(f'{uploader} 游戏已自动热更新, 重新开局即可生效;\n'
                          '游戏规则、描述、成就、倍率等属性的修改需等待 bot 重启后生效')
         return '\n'.join(lines)
 
@@ -1342,7 +1399,7 @@ def _compile_text(cfg: dict, record: dict, result: dict, game: str,
         if link:
             lines.append(link)
         lines += _rollback_lines(record)
-        lines.append(_fail_next_step(result, game, record))
+        lines.append(_fail_next_step(result, record))
         if at_dev:
             lines.append(at_dev + ' 请复查编译问题')
         return '\n'.join(lines)
@@ -1353,7 +1410,7 @@ def _compile_text(cfg: dict, record: dict, result: dict, game: str,
     rc = result.get('returncode')
     lines = [f'❌ {compilemod.STATUS_LABELS.get(st, "编译失败")}'
              + (f' (退出码 {rc})' if rc is not None else '') + ', 需人工排查']
-    reason = _compile_reason(result)
+    reason = _compile_reason(result, game)
     if reason:
         lines.append(f'❗ 原因: {reason}')
     lines += [
@@ -1365,7 +1422,7 @@ def _compile_text(cfg: dict, record: dict, result: dict, game: str,
     # 这两种上传者做什么都没用 —— 目标名非法要换合规目录名, 接口配置错了得管理员
     # 去面板改; 给「改代码重传」或「稍后重编」都是把人往沟里带, 交给被 @ 的开发者
     if st not in ('invalid', 'misconfig'):
-        lines.append(_fail_next_step(result, game, record))
+        lines.append(_fail_next_step(result, record))
     if at_dev:
         lines.append(at_dev + ' 请复查编译问题')
     return '\n'.join(lines)

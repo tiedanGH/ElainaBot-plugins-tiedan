@@ -1428,7 +1428,9 @@ def _norm_findings(value, allowed: tuple) -> list:
     """规整 findings 为 [{category, target, line, suspect, reason}]。
 
     target 剥掉引号/换行等非路径字符并截断, line 强转非负整数 —— 即使模型违规把
-    原文塞进 target, 也只会剩下一段截断的"疑似路径"。这两个字段是群消息用的。
+    原文塞进 target, 也只会剩下一段截断的"疑似路径"。群消息只用 line 与 target 里的
+    **固定文件名** (flow._finding_lines(public=True)): 路径本身是上传者起的名字, 又是
+    模型报的, 两样都不能原样进群。
     reason 另按 _clean_reason 处理, **只供网页报告与后台**, 见上方注释。
     """
     out = []
