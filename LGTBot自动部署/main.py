@@ -73,6 +73,21 @@ rule.md / unittest.cc), 可以多出其他文件, 缺少任一项即拒绝并汇
     与「引用的不是压缩包」那几条同级。此前只有文件夹名与压缩包基名过 deploy.bad_name,
     单文件自己的名字没人管, 引用一个 .DS_Store 就能把它写进游戏目录。
 
+.py 文件预检 (force 同样拒绝, 两种上传都拦, 与隐藏文件同一套做法; stage='script'、不 @
+开发者): 主框架每 2 秒递归扫一遍每个插件目录 (data/ 也在内), 任何不以 _ 开头的 .py 有
+增删改就热重载那个插件。上传物在本插件里要落到 data/staging、data/backups、data/pending,
+部署进 games/ 又落在 LGTBot_ElainaBot 的插件目录下 —— 一个 .py 就是一次热重载。1.18.0
+出过一次: 新游戏包里带了个生成素材用的 .py, 解压进 staging 的两秒内本插件被重载, 审核
+中的任务被取消, 上传者只看到「已收到」就再没下文。游戏目录本来也用不到 .py (CMake 只认
+mygame.cc、头文件、rule.md、icon.png、resource/、option.cmake)。服务器上早就有 .py 的
+旧目录同样不能挪进备份, 那种更新直接报错、请管理员先清理 (deploy.reload_triggers)。
+
+任务被取消 (插件热重载 / 机器人重启) 时的收尾 (app/flow.py 的 _cancelled): 还在审核就记成
+stage='cancelled'; 新代码已经落进 games/、还没拿到编译结论的, 按临时性编译失败收拾 ——
+恢复原状、新代码进暂存, /compile 能接着编。两种都会在群里回一句, 不再石沉大海。落地、换回
+暂存与「编译结论到手后的收尾」都不许被取消拦腰截断 (先做完再把取消抛出去), 否则文件动了
+记录里却没有。
+
 自动编译 (app/compile.py): 部署成功后按游戏名请求 LGTBot_ElainaBot 的编译 API,
 超时 (默认 180s) 自动发送取消请求; 编译成功的常规更新只提示上传者已热更新, 并说明
 规则/成就/游戏描述/倍率等属性的修改仍需重启 (完全不 @ 开发者); 编译失败/超时
@@ -179,7 +194,7 @@ __plugin_meta__ = {
     'name': 'LGTBot 自动部署',
     'author': '铁蛋',
     'description': '/upload 引用群文件上传到 lgtbot 目录, 自动内容审核 + 请求编译 + 目录权限管理',
-    'version': '1.18.0',
+    'version': '1.18.1',
 }
 
 log = get_logger(PLUGIN, 'LGTBot自动部署')

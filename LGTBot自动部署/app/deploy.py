@@ -76,6 +76,23 @@ def _out(ok: bool, name: str, error: str = '', dest: str = '', backup: str = '',
             'note': note, 'replaced': replaced, 'backup_temp': backup_temp}
 
 
+def reload_triggers(path: str) -> list:
+    """目录里会让主框架热重载的文件 (相对路径): 与框架的文件监视同一条规则 ——
+    文件名以 .py 结尾、不以 _ 开头 (见 core/plugin/_watcher.py)。
+
+    被替换的旧版本要挪进 data/backups, 那在本插件目录里; 带着这种文件挪进去, 框架
+    下一轮扫描就会重载本插件, 正在跑的这次部署当场被取消 (旧目录已挪走、新代码已
+    落地、编译还没请求)。新上传的包在解压前就拦了 .py (archive._reject_scripts),
+    能走到这里的只有服务器上早就有的旧目录 —— 比如以前强制上传进去的。
+    """
+    out = []
+    for d, _, files in os.walk(path):
+        for f in files:
+            if f.endswith('.py') and not f.startswith('_'):
+                out.append(os.path.relpath(os.path.join(d, f), path).replace(os.sep, '/'))
+    return sorted(out)
+
+
 def _stash(src: str, rel: str) -> str:
     """把将被替换的旧目录 / 旧文件挪进 ``data/backups/``, 返回备份路径。
 
@@ -114,6 +131,12 @@ def deploy_archive(staging: str, root: str, base_name: str, target: dict, cfg: d
     replaced = os.path.exists(dest)
     backup = ''
     if replaced:
+        hits = reload_triggers(dest) if os.path.isdir(dest) else []
+        if hits:
+            shown = '、'.join(hits[:5]) + (f' 等 {len(hits)} 个' if len(hits) > 5 else '')
+            return _out(False, base_name,
+                        f'服务器上的旧版本里有 .py 文件 ({shown}), 替换时要挪进插件的备份目录, '
+                        '会触发框架热重载、打断这次部署; 请管理员先在服务器上删掉这些文件', dest)
         try:
             backup = _stash(dest, base_name)
         except OSError as e:

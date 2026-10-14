@@ -3,8 +3,9 @@
 解压前逐条校验成员名, 拦截 zip-slip (``../`` / 绝对路径 / 盘符) 与
 tar 里的软链接、设备文件, 并对文件数、解压后总体积设硬上限 —— 上传者是普通
 群成员, 压缩包必须当成不可信输入处理。
-解压前还做一道预检: 包内出现以 ``.`` 开头的隐藏文件/目录 (.git、.DS_Store、
-.vscode 等) 就整包拒收, 一个字节都不落盘 (见 ``_reject_hidden``)。
+解压前还做两道预检, 命中就整包拒收、一个字节都不落盘: 以 ``.`` 开头的隐藏文件/
+目录 (.git、.DS_Store、.vscode 等, 见 ``_reject_hidden``); ``.py`` 文件 (会触发
+主框架热重载, 见 ``_reject_scripts``)。
 
 解压落到 data/staging/<记录号>/, 审核通过后才由 deploy.py 移入正式目录。
 """
@@ -41,6 +42,10 @@ class ArchiveError(Exception):
 
 class HiddenMemberError(ArchiveError):
     """压缩包里带了以 . 开头的隐藏文件/目录。"""
+
+
+class ScriptMemberError(ArchiveError):
+    """压缩包里带了 .py 文件。"""
 
 
 # ==================== 成员名校验 ====================
@@ -102,6 +107,42 @@ def _reject_hidden(names):
     raise HiddenMemberError(f'压缩包内含以 . 开头的隐藏文件/目录: {shown}{more}')
 
 
+def is_script(name: str) -> bool:
+    """单个文件名 / 成员路径是不是 .py (不分大小写)。"""
+    return (name or '').replace('\\', '/').strip().rstrip('/').lower().endswith('.py')
+
+
+def script_members(names) -> list:
+    """列出 .py 成员 (任意层级), 去重保序。"""
+    out = []
+    for raw in names:
+        norm = (raw or '').replace('\\', '/').strip().strip('/')
+        if is_script(norm) and norm not in out:
+            out.append(norm)
+    return out
+
+
+def _reject_scripts(names):
+    """解压**前**的预检: 带 .py 就整包拒收, 一个字节都不落盘。
+
+    不能放行的理由在主框架: 它每 2 秒递归扫一遍**每个插件目录** (data/ 也在内), 任何
+    .py (不以 _ 开头) 新增 / 修改 / 删除都会热重载那个插件。上传物在本插件里要落到
+    data/staging (解压)、data/backups 与 data/pending (替换与回滚), 部署进 games/ 又
+    落在 LGTBot_ElainaBot 的插件目录下 —— 落到哪, 就重载谁。本插件被重载时 cancel_all
+    会取消正在跑的上传任务: 上传者只看到「已收到」就再没下文, 记录里只剩「任务被取消」。
+
+    游戏目录本来也用不到 .py: CMake 只认 mygame.cc、头文件、rule.md、icon.png、resource/
+    与 option.cmake; 实测出事的那个包里, .py 只是重新生成素材用的开发脚本。
+    ``__init__.py`` 这类 _ 开头的不会触发重载, 但同样没有理由进游戏目录, 一并拦下。
+    """
+    hits = script_members(names)
+    if not hits:
+        return
+    shown = '、'.join(hits[:_MAX_SHOWN_HIDDEN])
+    more = f' 等 {len(hits)} 个' if len(hits) > _MAX_SHOWN_HIDDEN else ''
+    raise ScriptMemberError(f'压缩包内含 .py 文件: {shown}{more}')
+
+
 # ==================== 解压 ====================
 
 def _extract_zip(data: bytes, dest: str, limits: dict) -> int:
@@ -111,6 +152,7 @@ def _extract_zip(data: bytes, dest: str, limits: dict) -> int:
         if len(infos) > limits['max_files']:
             raise ArchiveError(f'压缩包成员数 {len(infos)} 超过上限 {limits["max_files"]}')
         _reject_hidden(i.filename for i in infos)
+        _reject_scripts(i.filename for i in infos if not i.is_dir())
         for info in infos:
             name = _safe_member_name(info.filename)
             if not name:
@@ -135,6 +177,7 @@ def _extract_tar(data: bytes, dest: str, limits: dict) -> int:
         if len(members) > limits['max_files']:
             raise ArchiveError(f'压缩包成员数 {len(members)} 超过上限 {limits["max_files"]}')
         _reject_hidden(m.name for m in members)
+        _reject_scripts(m.name for m in members if not m.isdir())
         for m in members:
             name = _safe_member_name(m.name)
             if not name:

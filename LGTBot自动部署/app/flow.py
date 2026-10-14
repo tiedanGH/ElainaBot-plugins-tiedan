@@ -38,6 +38,7 @@ force 由主人本人发起, 完成后不再 @ 通知部署人员。
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import os
 import time
@@ -81,6 +82,7 @@ def usage() -> str:
     ]
     if required:
         lines.append('🔸压缩包必须包含: ' + '、'.join(required))
+    lines.append('🔸不能带 .py 文件与以 . 开头的隐藏文件 (开发脚本请留在本地)')
     lines.append('🔸rule.md 需有原作标注 (改编需注明「改编自 X」)')
     lines.append('🔸新游戏上传成功后目录自动绑定上传者, 此后仅绑定用户可更新该目录')
     lines.append('🔸审核通过后自动请求编译并回报结果')
@@ -177,6 +179,12 @@ async def handle(event, argline: str, force: bool = False) -> bool:
         await _send(event, f'❌ 不接受以 . 开头的隐藏文件「{fname}」\n'
                            '这类文件 (.DS_Store、.gitignore 等) 不应进入游戏目录, '
                            '请确认引用的是正确的文件')
+        return False
+    # .py 同理 (理由见 archive._reject_scripts): 而且必须拦在下载之前 —— 留档原件会写成
+    # data/archives/<记录号>_<文件名>, 以 .py 结尾, 一落盘就触发本插件热重载
+    if archive.is_script(fname):
+        await _send(event, f'❌ 不接受 .py 文件「{fname}」\n'
+                           '游戏目录用不到 Python 脚本, 开发用的脚本请留在本地')
         return False
     is_archive = quoted.archive_ext(fname) in quoted.ARCHIVE_EXTS
     if not folder and not is_archive:
@@ -291,8 +299,8 @@ async def _run(event, cfg: dict, ref: dict, target: dict, folder: str,
     try:
         await _pipeline(event, cfg, ref, record, target, folder, force)
     except asyncio.CancelledError:
-        record.update(stage='cancelled', error='任务被取消 (插件卸载或重载)')
-        _persist(record)
+        game = folder or record.get('deploy_name') or deploy.strip_archive_ext(record['filename'])
+        await _cancelled(event, cfg, record, game, landed=record.get('stage') == 'deployed')
         raise
     except Exception as e:  # noqa: BLE001 — 兜底: 未预期异常也要给结论 + 留记录
         report_error(PLUGIN, 'LGTBot自动部署', e,
@@ -306,10 +314,15 @@ async def _run(event, cfg: dict, ref: dict, target: dict, folder: str,
 
 
 def _persist(record: dict):
-    """补上耗时后写入记录 (内部字段不落盘)。"""
+    """补上耗时后写入记录 (内部字段不落盘)。
+
+    各收尾路径都是先落盘再发消息; ``_persisted`` 标记让取消收尾 (_cancelled) 知道
+    结论已经记下, 不再补写一条同号记录。
+    """
     data = {k: v for k, v in record.items() if not k.startswith('_')}
     data['elapsed'] = round(time.time() - record.get('_started', time.time()), 1)
     store.add_record(data)
+    record['_persisted'] = True
 
 
 async def _pipeline(event, cfg: dict, ref: dict, record: dict, target: dict, folder: str,
@@ -381,6 +394,13 @@ async def _pipeline(event, cfg: dict, ref: dict, record: dict, target: dict, fol
                 event, cfg, record, '压缩包含隐藏文件, 已拒收', notify=False,
                 suffix='请删掉这些以 . 开头的文件/目录后重新打包上传 '
                        '(常见的是 .git、.DS_Store、.vscode)')
+        except archive.ScriptMemberError as e:
+            # 同样排在 ArchiveError 之前、同样不 @ 开发者: 删掉重打就好
+            record.update(stage='script', error=str(e))
+            return await _finish_fail(
+                event, cfg, record, '压缩包含 .py 文件, 已拒收', notify=False,
+                suffix='请删掉这些 .py 文件后重新打包上传 (游戏目录用不到 Python 脚本, '
+                       '生成素材之类的开发脚本请留在本地)')
         except archive.ArchiveError as e:
             record.update(stage='extract', error=str(e))
             return await _finish_fail(event, cfg, record, '压缩包校验失败')
@@ -679,29 +699,33 @@ _RESTART_RECORD_KEYS = ('status', 'ok', 'error', 'http_status', 'enabled', 'auto
                         'reason', 'active_matches', 'message')
 
 
-async def _finish_deploy(event, cfg: dict, record: dict, data: bytes, staging: str,
-                         info: dict, target: dict, folder: str, skip_reason: str = ''):
+async def _uninterrupted(fn, *args):
+    """在线程里跑一个会改动 games/ 的操作; 取消到达时先等它做完, 再把取消抛出去。
+
+    to_thread 被取消时线程照跑, 只是 await 的这一方当场收到 CancelledError、拿不到
+    结果 —— 文件已经挪了, 记录里却没有, 取消收尾 (_cancelled) 也就不知道该恢复什么。
+    所以 ``fn`` 要自己把结果登记进记录 (见 _land / _reland), 这里只保证它跑完。
+    """
+    fut = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    try:
+        return await asyncio.shield(fut)
+    except asyncio.CancelledError:
+        await fut
+        raise
+
+
+def _land(record: dict, data: bytes, staging: str, info: dict, target: dict, folder: str,
+          cfg: dict) -> dict:
+    """落地 + 登记 (同步, 在线程里跑): 挪文件、记下回滚要用的信息、作废上一份暂存、
+    新游戏绑定目录。做成一个整体, 是因为文件一挪这几样就必须跟上 (见 _uninterrupted)。"""
     fname = record['filename']
     if folder:
-        res = await asyncio.to_thread(deploy.deploy_single, data, fname, folder, target, cfg)
+        res = deploy.deploy_single(data, fname, folder, target, cfg)
     else:
-        base = deploy.strip_archive_ext(fname)
-        res = await asyncio.to_thread(deploy.deploy_archive, staging, info['root'], base, target, cfg)
-
+        res = deploy.deploy_archive(staging, info['root'], deploy.strip_archive_ext(fname),
+                                    target, cfg)
     if not res['ok']:
-        record.update(stage='deploy', error=res['error'])
-        _persist(record)
-        lines = [
-            _DEPLOY_FAIL_HEAD.get(skip_reason, _DEPLOY_FAIL_HEAD['']),
-            f'📦 文件: {fname} → {_where(record)}',
-            f'❗ 原因: {res["error"]}',
-            f'🆔 记录: {record["id"]}',
-        ]
-        at = _mentions(cfg, record)
-        if at:
-            lines.append(at + ' 请人工处理')
-        return await _send(event, '\n'.join(lines))
-
+        return res
     record.update(stage='deployed', dest=res['dest'], deploy_name=res['name'],
                   backup=res['backup'], replaced=res['replaced'],
                   backup_temp=res['backup_temp'])
@@ -720,6 +744,29 @@ async def _finish_deploy(event, cfg: dict, record: dict, data: bytes, staging: s
             record['perm_bound'] = True
         except OSError as e:
             log.warning(f'目录权限绑定失败: {e}')
+    return res
+
+
+async def _finish_deploy(event, cfg: dict, record: dict, data: bytes, staging: str,
+                         info: dict, target: dict, folder: str, skip_reason: str = ''):
+    fname = record['filename']
+    res = await _uninterrupted(_land, record, data, staging, info, target, folder, cfg)
+
+    if not res['ok']:
+        record.update(stage='deploy', error=res['error'])
+        _persist(record)
+        lines = [
+            _DEPLOY_FAIL_HEAD.get(skip_reason, _DEPLOY_FAIL_HEAD['']),
+            f'📦 文件: {fname} → {_where(record)}',
+            f'❗ 原因: {res["error"]}',
+            f'🆔 记录: {record["id"]}',
+        ]
+        at = _mentions(cfg, record)
+        if at:
+            lines.append(at + ' 请人工处理')
+        return await _send(event, '\n'.join(lines))
+
+    game = folder if folder else res['name']
 
     # ---- 部署结果消息 (含「已请求编译」提示) ----
     head = _DEPLOY_HEAD.get(skip_reason, _DEPLOY_HEAD[''])
@@ -772,6 +819,20 @@ async def _compile_and_report(event, cfg: dict, record: dict, game: str) -> dict
     # ---- 请求编译: 新游戏带 new=true 走完整编译, 老游戏更新走增量 ----
     result = await compilemod.request_compile(game, cfg, is_new=bool(record.get('is_new')))
     record['compile'] = {k: result.get(k) for k in _COMPILE_RECORD_KEYS}
+    # 结论一到手, 后面的收尾 (计划重启、收拾 games/、留档、落盘、回报) 就不许被取消
+    # 拦腰截断 —— 否则可能请求了重启却没记下、编不过的代码撤了却没登记。单独起一个
+    # 任务跑完它; 被取消就等它收完尾再走 (它落盘之后, _cancelled 不会再补写记录)
+    tail = asyncio.ensure_future(_report_compile(event, cfg, record, result, game))
+    try:
+        await asyncio.shield(tail)
+    except asyncio.CancelledError:
+        await tail
+        raise
+    return result
+
+
+async def _report_compile(event, cfg: dict, record: dict, result: dict, game: str):
+    """编译结论到手之后的收尾 (见 _compile_and_report)。"""
     notes = ['## 编译结果\n' + compilemod.describe(result)]
 
     # ---- 新游戏编译成功 → 请求计划重启 (自动模式), 不再 @ 开发者安排重启 ----
@@ -800,7 +861,6 @@ async def _compile_and_report(event, cfg: dict, record: dict, game: str) -> dict
     # 重试 3 次、间隔 60s, 再加最长 compile_timeout 的编译) 很容易超过被动消息 ID
     # 的 5 分钟有效期, 用被动只会把结论静默丢掉 —— 不差这一条主动额度。
     await _send(event, _compile_text(cfg, record, result, game, restart, link), active=True)
-    return result
 
 
 def _fail_next_step(result: dict, game: str, record: dict) -> str:
@@ -890,6 +950,67 @@ def _rollback_lines(record: dict) -> list:
         return []
     ok = (record.get('rollback') or {}).get('ok')
     return [('↩️ ' if ok else '⚠️ ') + text]
+
+
+# ==================== 任务被取消 ====================
+
+_CANCELLED = '任务被取消 (插件卸载或重载)'
+
+
+async def _cancelled(event, cfg: dict, record: dict, game: str, landed: bool):
+    """任务被取消 (多半是插件热重载或机器人重启) 时的收尾; 调用方随后把取消原样抛出。
+
+    · 结论已经落盘: 只差最后那条消息, 不再折腾 (各收尾路径都是先落盘再发消息);
+    · 新代码已经落进 games/、还没拿到编译结论 (``landed``): 按临时性失败收拾 (见 _settle)
+      —— games/ 恢复原状, 新代码进 data/pending, 记录记成「编译异常」, /compile 照常
+      能接着编。不收拾的话, 那份没编过的代码就一直躺在 games/ 下;
+    · 其余 (多半还在审核): 记成 stage='cancelled', 什么都没落地。
+    最后尽量在群里说一句 —— 上传者此前只看到「已收到」, 不说就是石沉大海。发送最多
+    等几秒, 发不出去就算了 (进程可能正在退出)。
+    """
+    if record.get('_persisted'):
+        return
+    if landed and not (record.get('compile') or {}).get('status'):
+        res = {'status': 'error', 'ok': False, 'error': _CANCELLED}
+        record['compile'] = {k: res.get(k) for k in _COMPILE_RECORD_KEYS}
+        try:
+            rollback = await asyncio.to_thread(_settle, record, res, game)
+        except Exception as e:  # noqa: BLE001 — 收尾出意外也不能挡住取消本身
+            log.warning(f'任务被取消后恢复服务器失败 ({record["id"]}): {type(e).__name__}: {e}')
+        else:
+            if rollback:
+                record['rollback'] = rollback
+                store.append_review_text(
+                    record['id'], '## 服务器上的代码 (任务被取消后)\n- ' + deploy.describe_rollback(record)
+                    + (f'\n- 错误: {rollback["error"]}' if rollback.get('error') else ''))
+    elif not landed and record.get('stage') != 'recompile':
+        record['stage'] = 'cancelled'
+    # 已落地那支 stage 仍是 deployed、编译记成「异常」, 光看这两样分不出是插件自己被打断 ——
+    # 单独打个标记 (面板与查重据此认出「这次没得出结论」)
+    record.update(error=_CANCELLED, cancelled=True)
+    _persist(record)
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(_send(event, _cancel_text(cfg, record, game), active=True), 8)
+
+
+def _cancel_text(cfg: dict, record: dict, game: str) -> str:
+    """任务被取消时给上传者的说明。
+
+    还没落地的 (stage='cancelled') 让他重新上传; 已经落地或本来就是 /compile 的,
+    新代码在暂存 (或还在服务器上), /compile 就能接着编。
+    """
+    lines = ['⚠️ 处理被中断 (插件重载或机器人重启), 这次没有完成',
+             f'📦 文件: {record["filename"]} → {_where(record)}']
+    lines += _rollback_lines(record)
+    lines.append(f'🆔 记录: {record["id"]}')
+    if record.get('stage') == 'cancelled':
+        lines.append('> 💡 请稍后重新上传')
+    else:
+        lines.append(f'> 💡 稍后发 /compile {game} 重试即可，无需重传')
+    at = _mentions(cfg, record)
+    if at:
+        lines.append(at + ' 请知悉')
+    return '\n'.join(lines)
 
 
 def _compile_reason(result: dict) -> str:
@@ -987,6 +1108,20 @@ async def handle_recompile(event, argline: str) -> bool:
     return True
 
 
+def _reland(record: dict, held: str, game: str, last: dict, cfg: dict) -> dict:
+    """把暂存的新代码换回 games/ 并登记 (同步, 在线程里跑; 与 _land 同理做成一个整体)。"""
+    res = deploy.deploy_pending(held, game, record['folder'], config.upload_target(), cfg)
+    if res['ok']:
+        record.update(dest=res['dest'], backup=res['backup'], replaced=res['replaced'],
+                      backup_temp=res['backup_temp'],
+                      redeployed=(last.get('rollback') or {}).get('pending') or '')
+    else:
+        # 暂存还在原处: 把登记一并带到这条新记录上, 否则 /compile 下次只看得到这条
+        # (last_game_record 取最近一条), 那份暂存就再也够不着了
+        record.update(error=res['error'], rollback=dict(last.get('rollback') or {}))
+    return res
+
+
 async def _run_recompile(event, cfg: dict, game: str, last: dict):
     """按上次那条记录的参数重新编译, 另写一条 stage='recompile' 记录。
 
@@ -1040,29 +1175,26 @@ async def _run_recompile(event, cfg: dict, game: str, last: dict):
         header=(f'# 重新编译 {rid}\n- 时间: {record["time"]}\n'
                 f'- 发起人: {record["username"] or record["user_id"]}\n'
                 f'- 目录: {game}\n- 依据记录: {last.get("id")}'))
+    held = store.pending_of(last)
     try:
-        held = store.pending_of(last)
         if held:
-            res = await asyncio.to_thread(deploy.deploy_pending, held, game, record['folder'],
-                                          config.upload_target(), cfg)
+            res = await _uninterrupted(_reland, record, held, game, last, cfg)
             if not res['ok']:
-                # 暂存还在原处: 把登记一并带到这条新记录上, 否则 /compile 下次只看得到
-                # 这条 (last_game_record 取最近一条), 那份暂存就再也够不着了
-                record.update(error=res['error'], rollback=dict(last.get('rollback') or {}))
                 _persist(record)
                 await _send(event, _fail_text(record, cfg, '暂存的新代码没能放回服务器'), active=True)
                 return
-            record.update(dest=res['dest'], backup=res['backup'], replaced=res['replaced'],
-                          backup_temp=res['backup_temp'],
-                          redeployed=(last.get('rollback') or {}).get('pending') or '')
             store.append_review_text(rid, f'已把记录 {last.get("id")} 暂存的新代码放回服务器后再编译')
         await _send(event, f'🔧 已请求重新编译「{_game_label(record, game)}」'
                            + ('（新游戏完整编译, 耗时更长）' if record['is_new'] else '')
                            + ', 请耐心等待结果…')
         await _compile_and_report(event, cfg, record, game)
     except asyncio.CancelledError:
-        record.update(error='任务被取消 (插件卸载或重载)')
-        _persist(record)
+        # 有暂存却还没换回去 (redeployed 由 _reland 登记): 暂存仍在原处, 登记带到这条
+        # 记录上 —— 理由同 _reland 失败那支; 换回去了或本来就编服务器上的, 按已落地收拾
+        landed = bool(record.get('redeployed')) or not held
+        if not landed and store.pending_of(last):
+            record['rollback'] = dict(last.get('rollback') or {})
+        await _cancelled(event, cfg, record, game, landed)
         raise
     except Exception as e:  # noqa: BLE001
         report_error(PLUGIN, 'LGTBot自动部署', e, context={'record': rid, 'game': game})
@@ -1077,7 +1209,7 @@ async def _run_recompile(event, cfg: dict, game: str, last: dict):
 
 _STAGE_TEXT = {
     'received': '未处理完', 'download': '下载失败', 'extract': '解压或校验失败',
-    'integrity': '压缩包不完整', 'hidden': '含隐藏文件被拒',
+    'integrity': '压缩包不完整', 'hidden': '含隐藏文件被拒', 'script': '含 .py 文件被拒',
     'review': '审核阶段结束', 'deploy': '部署失败',
     'deployed': '已部署', 'duplicate': '重复上传被拒', 'recompile': '重新编译',
     'error': '处理异常', 'cancelled': '任务被取消',
