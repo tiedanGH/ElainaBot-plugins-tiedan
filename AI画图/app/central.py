@@ -1,6 +1,7 @@
 """中央 AI LLM 适配层：接口目录、提示词优化、内容审核与生图调用。"""
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import json
@@ -283,12 +284,15 @@ def _scrub(text, secret: str = '') -> str:
     return _BEARER.sub('Bearer [密钥已隐藏]', value)
 
 
-def _direct_endpoint(config: dict, provider_id: str) -> dict:
+def _direct_endpoint(config: dict, provider_id: str, *,
+                     path_key: str = 'chat_path',
+                     default_path: str = '/chat/completions',
+                     reason: str = '') -> dict:
     """取直连所需的接口信息。**调试开关关闭时直接抛错，不碰密钥。**"""
     if not config.get('debug_direct_request'):
         raise RuntimeError(
-            '插件直连未开启：该中转把图片放在 message.images 里，中央模块只取 content。'
-            '需要在面板「生图线路」页打开「插件直连调试」，插件才会读取接口密钥自行请求'
+            (reason or '该中转把图片放在 message.images 里，中央模块只取 content')
+            + '。需要在面板「生图线路」页打开「插件直连调试」，插件才会读取接口密钥自行请求'
         )
     service = get_service()
     if service is None:
@@ -307,7 +311,7 @@ def _direct_endpoint(config: dict, provider_id: str) -> dict:
     api_key = str(provider.get('api_key') or '')
     if not base_url or not api_key:
         raise RuntimeError('该接口缺少 Base URL 或 API Key，无法直连')
-    path = str(provider.get('chat_path') or '/chat/completions').strip()
+    path = str(provider.get(path_key) or default_path).strip()
     return {
         'endpoint': base_url + '/' + path.lstrip('/'),
         'api_key': api_key,
@@ -443,6 +447,75 @@ async def _chat_image(config: dict, prompt: str, route: dict) -> dict:
     }
 
 
+async def _direct_images_endpoint(config: dict, prompt: str, route: dict, timeout: int) -> dict:
+    """绕过中央模块直接请求生图端点，只为把超时放到 180 秒以上。
+
+    请求体与中央模块完全一致；密钥处理同 `_direct_chat_image`：只在本函数内
+    构造请求头，外抛文本一律过 `_scrub()`。
+    """
+    target = _direct_endpoint(
+        config, route['provider_id'],
+        path_key='image_path', default_path='/images/generations',
+        reason=f'这条线路要求 {timeout} 秒超时，超过了中央模块 '
+               f'{draw_config.CENTRAL_IMAGE_TIMEOUT_CAP} 秒的生图上限',
+    )
+    secret = target['api_key']
+    payload = {
+        'model': route['model'],
+        'prompt': prompt,
+        'size': str(config.get('image_size') or '1024x1024'),
+        'n': 1,
+    }
+    client_timeout = aiohttp.ClientTimeout(total=max(10, min(600, timeout)))
+    try:
+        async with aiohttp.ClientSession(timeout=client_timeout) as session:
+            async with session.post(
+                target['endpoint'],
+                headers={
+                    'Authorization': f'Bearer {secret}',
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
+                },
+                json=payload,
+                allow_redirects=False,
+            ) as response:
+                raw = await response.text()
+                if response.status < 200 or response.status >= 300:
+                    raise RuntimeError(f'HTTP {response.status}: {_scrub(raw[:600], secret)}')
+    except RuntimeError:
+        raise
+    except Exception as error:  # noqa: BLE001 - 网络异常也要脱敏后再上抛
+        raise RuntimeError('直连生图失败：' + _scrub(error, secret)[:300]) from None
+    try:
+        item = json.loads(raw)['data'][0]
+    except (ValueError, KeyError, IndexError, TypeError):
+        raise RuntimeError(
+            '直连生图返回里没有 data[0]：' + _scrub(raw[:300], secret)
+        ) from None
+    return _normalize_image_result(item, route)
+
+
+def _normalize_image_result(item: dict, route: dict) -> dict:
+    """把 {url, b64_json} 归一成插件内部的结果结构。"""
+    encoded = str((item or {}).get('b64_json') or '').strip()
+    data = b''
+    if encoded:
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError, binascii.Error) as error:
+            raise RuntimeError('生图接口返回的图片数据无效') from error
+    url = str((item or {}).get('url') or '').strip()
+    if not data and not url.startswith(('http://', 'https://')):
+        raise RuntimeError('生图接口没有返回可用的图片')
+    return {
+        'data': data,
+        'url': url if url.startswith(('http://', 'https://')) else '',
+        'provider': provider_name(route['provider_id']),
+        'provider_id': route['provider_id'],
+        'model': route['model'],
+    }
+
+
 async def _images_endpoint(config: dict, prompt: str, route: dict) -> dict:
     """走标准 /v1/images/generations 出图。"""
     service = get_service()
@@ -453,23 +526,14 @@ async def _images_endpoint(config: dict, prompt: str, route: dict) -> dict:
         candidates=[route],
         size=str(config.get('image_size') or '1024x1024'),
     )
-    encoded = str(result.get('b64_json') or '').strip()
-    data = b''
-    if encoded:
-        try:
-            data = base64.b64decode(encoded, validate=True)
-        except (ValueError, TypeError, binascii.Error) as error:
-            raise RuntimeError('生图接口返回的图片数据无效') from error
-    url = str(result.get('url') or '').strip()
-    if not data and not url.startswith(('http://', 'https://')):
-        raise RuntimeError('生图接口没有返回可用的图片')
-    return {
-        'data': data,
-        'url': url if url.startswith(('http://', 'https://')) else '',
-        'provider': str(result.get('provider') or ''),
-        'provider_id': str(result.get('provider_id') or ''),
-        'model': str(result.get('model') or ''),
-    }
+    # 中央模块会回报它实际用的接口与模型，优先采信它的，而不是本地线路表。
+    value = _normalize_image_result(result, route)
+    value.update({
+        'provider': str(result.get('provider') or value['provider']),
+        'provider_id': str(result.get('provider_id') or value['provider_id']),
+        'model': str(result.get('model') or value['model']),
+    })
+    return value
 
 
 async def generate(config: dict, prompt: str, *, exclude=()) -> dict:
@@ -498,7 +562,7 @@ async def generate(config: dict, prompt: str, *, exclude=()) -> dict:
         try:
             if chat_mode:
                 return await _chat_via(config, prompt, route)
-            return await _images_endpoint(config, prompt, route)
+            return await _images_via(config, prompt, route)
         except Exception as error:  # noqa: BLE001 - 逐条线路汇总，最后统一上抛
             if chat_mode or not _IMAGES_ENDPOINT_REJECTED.search(str(error)):
                 errors.append(f'{label}: {error}')
@@ -512,6 +576,36 @@ async def generate(config: dict, prompt: str, *, exclude=()) -> dict:
                     f'{label}: 生图端点不支持该模型，自动改走对话端点后仍失败：{retry_error}'
                 )
     raise RuntimeError('；'.join(errors)[:1200])
+
+
+async def _images_via(config: dict, prompt: str, route: dict) -> dict:
+    """生图端点出图，按本条线路设定的超时执行。
+
+    中央模块把生图超时写死封顶在 180 秒，所以：
+    - 未设置或 ≤180 秒：仍走中央模块（审计/统计照常），用 `wait_for` 兜住上限；
+    - >180 秒：中央模块做不到，改由插件直连生图端点（需要直连调试开关）。
+    """
+    timeout = int(route.get('timeout') or 0)
+    cap = draw_config.CENTRAL_IMAGE_TIMEOUT_CAP
+    if timeout > cap:
+        if config.get('debug_direct_request'):
+            log.info('%s/%s 需要 %s 秒超时，超过中央模块 %s 秒上限，改走直连生图端点',
+                     provider_name(route['provider_id']), route['model'], timeout, cap)
+            return await _direct_images_endpoint(config, prompt, route, timeout)
+        log.warning(
+            '%s/%s 配置了 %s 秒超时，但中央模块生图最多只能到 %s 秒；'
+            '打开「插件直连调试」才能真正用上更长的超时',
+            provider_name(route['provider_id']), route['model'], timeout, cap,
+        )
+        timeout = 0
+    if timeout <= 0:
+        return await _images_endpoint(config, prompt, route)
+    try:
+        return await asyncio.wait_for(
+            _images_endpoint(config, prompt, route), timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        raise RuntimeError(f'生图超时：本条线路限定 {timeout} 秒') from None
 
 
 async def _chat_via(config: dict, prompt: str, route: dict) -> dict:

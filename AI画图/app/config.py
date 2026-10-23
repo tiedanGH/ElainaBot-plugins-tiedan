@@ -9,6 +9,9 @@ import threading
 IMAGE_SIZES = ('256x256', '512x512', '1024x1024', '1024x1536', '1536x1024')
 # image = /v1/images/generations；chat = /v1/chat/completions（Gemini 等多模态模型）
 ROUTE_MODES = ('image', 'chat')
+# 中央模块 generate_image() 把生图超时写死成 min(180, max(30, request_timeout))，
+# 所以走中央模块时最多只能撑到 180 秒；要更长只能由插件自己发请求。
+CENTRAL_IMAGE_TIMEOUT_CAP = 180
 
 DEFAULT_PROMPT_SYSTEM = (
     '你是文生图提示词工程师。把用户的中文画面需求改写成一段可以直接提交给生图模型的提示词。'
@@ -194,10 +197,13 @@ def validate(value: dict) -> dict:
             continue
         # mode=chat 走 /v1/chat/completions（Gemini 这类多模态模型不在生图端点上）
         mode = str(item.get('mode') or 'image').strip().casefold()
+        # 0 = 跟随中央模块的全局超时；否则 10~600 秒，按线路单独设定
+        timeout = _int_in(item.get('timeout'), 0, 0, 600)
         normalized.append({
             'provider_id': provider_id,
             'model': model,
             'mode': mode if mode in ROUTE_MODES else 'image',
+            'timeout': timeout if timeout == 0 else max(10, timeout),
             'enabled': bool(item.get('enabled', True)),
         })
         seen.add(key)
