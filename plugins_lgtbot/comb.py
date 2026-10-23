@@ -90,8 +90,8 @@ _QUERY_KEYS = frozenset(('查询', '机挖查询', '生草查询'))
 _FULL_SUFFIXES = ('full', '完整')
 
 # 本插件自用, 不做配置文件: 改名或停用时退回空串, 由中央按模型自动挑接口。
-_PROVIDER_NAME = 'YTea - Pro'
-_MODEL = 'gemini-3.1-flash-lite'
+_PROVIDER_NAME = 'YTea'
+_MODEL = ''
 _CONSUMER = 'comb_rank_review'
 
 # 最坏耗时 = TIMEOUT * TRIES + DELAY, 控制在 31s 内: 绝大多数查询命中缓存, 一次模型调用都不会发。
