@@ -351,7 +351,7 @@ def is_transient(result: dict) -> bool:
       异常 → 跟这份源码无关, 过会儿重编就行 —— /compile 存在的意义就是这几种。
 
     其余 (400/invalid 目标名非法、401 token 错、misconfig 接口地址填错) 两条路都不对症,
-    一律按非临时处理, 交给被 @ 的开发者。misconfig 尤其不能算临时 —— 地址填错了重试
+    一律按非临时处理, 交给被 @ 的开发者 (needs_admin)。misconfig 尤其不能算临时 —— 地址填错了重试
     一万次还是错的, 而它原先会以 InvalidUrlClientError 的形态落进 status='error'。
     """
     if not result or result.get('ok'):
@@ -381,6 +381,22 @@ def needs_reupload(result: dict) -> bool:
     if st == 'invalid':
         return True
     return st == 'failed' and not is_transient(result)
+
+
+def needs_admin(result: dict) -> bool:
+    """这次失败是不是只有管理员处理得了 —— 服务器 / 配置那边的问题, 上传者做什么都没用。
+
+    接口地址配错 (misconfig)、目标名过不了 API 白名单 (invalid; 新游戏在 flow.handle 就按更严
+    的规矩拦了, 走到这里的只剩服务器上已有的老目录), 以及既没有编译器输出、又不是临时问题的
+    拒绝 (401 token 错、400、404 之类)。flow 据此决定 @ 谁: 这些 @ 开发者; 编译器报错 (改代码
+    重传) 与临时问题 (稍后 /compile) 是上传者自己能处理的, @ 上传者。
+    """
+    if not result or result.get('ok'):
+        return False
+    st = result.get('status')
+    if st in ('misconfig', 'invalid'):
+        return True
+    return st == 'failed' and result.get('returncode') is None and not is_transient(result)
 
 
 def describe(result: dict) -> str:

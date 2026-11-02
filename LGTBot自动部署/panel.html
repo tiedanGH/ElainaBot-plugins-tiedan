@@ -198,7 +198,7 @@ pre.raw{background:var(--card2);border:1px solid var(--border);border-radius:12p
       <div class="hint" style="margin-top:10px">
         审核通过并部署后按游戏名请求单目标编译（同步等待）：新游戏走完整编译，老游戏走增量编译。<br>
         <b>新游戏</b>编译成功后自动请求 LGTBot 计划重启（维护模式 + 自动模式）：剩余对局清空后由 LGTBot 自行重启，本插件只发起请求、不跟踪重启是否发生。<br>
-        编译失败 / 超时 / 异常才 @ 开发者排查；编译与计划重启的结果、API 返回解析一并写入审核记录与留档。<br>
+        编译失败 / 超时 / 异常 @ 上传者复查；接口配置、token 这类服务器侧问题才 @ 开发者；编译与计划重启的结果、API 返回解析一并写入审核记录与留档。<br>
         「测试接口」走只读的 <code>/build/status</code>，只探测服务此刻可不可用，<b>不会触发任何编译</b>。
       </div>
       <div id="compile-test-result" class="result"></div>

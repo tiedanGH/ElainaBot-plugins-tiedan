@@ -118,7 +118,9 @@ stage='cancelled'; 新代码已经落进 games/、还没拿到编译结论的, �
 自动编译 (app/compile.py): 部署成功后按游戏名请求 LGTBot_ElainaBot 的编译 API,
 超时 (默认 180s) 自动发送取消请求; 编译成功的常规更新只提示上传者已热更新, 并说明
 规则/成就/游戏描述/倍率等属性的修改仍需重启 (完全不 @ 开发者); 编译失败/超时
-@ 开发者复查。编译结果 (含 API 返回解析) 进审核记录与留档。
+@ 上传者复查 —— 编译器报错要他改代码重传, 临时问题要他稍后 /compile, 都是他自己的事;
+只有接口配错、token 错、老目录名过不了白名单这类服务器 / 配置问题才 @ 开发者
+(compile.needs_admin)。编译结果 (含 API 返回解析) 进审核记录与留档。
 
 自动计划重启 (app/compile.py): 新游戏编译成功后自动请求 LGTBot 的计划重启 API
 (``POST /api/ext/lgtbot/planned-restart``, 与编译 API 同一枚 token), 开启维护模式 +
@@ -233,7 +235,7 @@ __plugin_meta__ = {
     'name': 'LGTBot 自动部署',
     'author': '铁蛋',
     'description': '/upload 引用群文件上传到 lgtbot 目录, 自动内容审核 + 请求编译 + 目录权限管理',
-    'version': '1.20.0',
+    'version': '1.20.1',
 }
 
 log = get_logger(PLUGIN, 'LGTBot自动部署')

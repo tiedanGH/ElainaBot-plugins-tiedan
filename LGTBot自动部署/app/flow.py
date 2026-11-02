@@ -26,7 +26,9 @@ force 由主人本人发起, 完成后不再 @ 通知部署人员。
   · 审核 + 部署放到后台任务里跑: 框架对 handler 有 300 秒硬超时, 而一次
     带图审核可能更久, 放后台可避免被取消。发送结果时优先被动 reply
     (不占主动消息额度), 失败再退主动消息。
-  · 任何一步失败都写记录 + 在群里给结论, 且**无论结果如何都 @ 部署人员**。
+  · 任何一步失败都写记录 + 在群里给结论。上传者自己就能处理的拒收 (重复上传、隐藏文件、
+    .py、名称不一致) 不 @ 人; 编译问题 @ 上传者, 服务器 / 配置那边的才 @ 部署人员 (见
+    _compile_text); 其余要人出手的 @ 部署人员。
   · 同时只处理一个上传任务 (解压 / 审核都吃内存与带宽), 排队请求直接拒绝。
   · 新游戏编译成功后自动请求 LGTBot 计划重启 (自动模式, 维护原因「新游戏《X》」, 见 _restart_reason),
     请求成功即不再 @ 开发者 —— 对局清空后由 LGTBot 自行重启, 本插件不跟踪;
@@ -1441,11 +1443,13 @@ def _compile_text(cfg: dict, record: dict, result: dict, game: str,
                   restart: dict | None = None, link: str = '') -> str:
     """编译结果消息。
 
-    @ 规则 (force 一律不 @):
+    @ 规则 (「上传者」是发起这次的人, /compile 就是发指令的那位; 开发者那边 force 一律不 @):
       · 编译成功 + 常规更新 → 只 @ 上传者 (热更新提示), 完全不 @ 开发者
       · 编译成功 + 新游戏   → @ 上传者 (需等重启); 计划重启请求成功则不 @ 开发者,
         只有请求失败才 @ 开发者手动安排重启 (见 _restart_lines)
-      · 编译失败 / 超时 / 异常 → @ 开发者复查排查
+      · 编译失败 / 超时 / 异常 → @ 上传者复查: 编译器报错要他改代码重传, 临时问题要他稍后
+        /compile。只有服务器 / 配置那边的问题 (compile.needs_admin: 接口配错、token 错、目标名
+        过不了白名单之类) 上传者做什么都没用, 才 @ 开发者
     """
     at_dev = _mentions(cfg, record)
     uploader = f'<@{record["user_id"]}>' if record.get('user_id') else ''
@@ -1482,8 +1486,8 @@ def _compile_text(cfg: dict, record: dict, result: dict, game: str,
             lines.append(link)
         lines += _rollback_lines(record)
         lines.append(_fail_next_step(result, record, game))
-        if at_dev:
-            lines.append(at_dev + ' 请复查编译问题')
+        if uploader:
+            lines.append(uploader + ' 请复查编译问题')
         return '\n'.join(lines)
 
     if st == 'disabled':
@@ -1501,10 +1505,13 @@ def _compile_text(cfg: dict, record: dict, result: dict, game: str,
         link or '📄 编译日志与 API 返回已留档, 请在后台「LGTBot 自动部署」页查看',
     ]
     lines += _rollback_lines(record)
-    # 这两种上传者做什么都没用 —— 目标名非法要换合规目录名, 接口配置错了得管理员
-    # 去面板改; 给「改代码重传」或「稍后重编」都是把人往沟里带, 交给被 @ 的开发者
-    if st not in ('invalid', 'misconfig'):
+    # 服务器 / 配置那边的问题上传者做什么都没用 (接口配错、token 错要管理员去改, 老目录名
+    # 过不了白名单也只有管理员能动): 给「改代码重传」或「稍后重编」都是把人往沟里带, 交给开发者。
+    # 其余是上传者自己的事 —— 编译器报错改代码重传, 临时问题稍后 /compile
+    admin = compilemod.needs_admin(result)
+    if not admin:
         lines.append(_fail_next_step(result, record, game))
-    if at_dev:
-        lines.append(at_dev + ' 请复查编译问题')
+    at = at_dev if admin else uploader
+    if at:
+        lines.append(at + ' 请复查编译问题')
     return '\n'.join(lines)
