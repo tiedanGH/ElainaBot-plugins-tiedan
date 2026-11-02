@@ -7,6 +7,12 @@
 # 只同步 git 已跟踪的文件；测试环境的 data/ 运行数据原样保留，
 # 仓库中已删除的文件会在测试目录一并删除。
 # 插件名含中文，所有 git 读取都走 -z 并关掉 quotepath，否则路径会被转义成八进制。
+#
+# 各插件的 tests/ **一律不同步**，即使已提交（LGTBot游戏问答 的就是提交的）：
+# 框架每 2 秒递归扫插件目录，任何不以 _ 开头的 .py 增删改都会热重载整个插件
+# （core/plugin/_watcher.py）。测试文件进了运行目录，改一行用例就重载一次线上插件，
+# 在跑的问答当场被取消。测试本来就从仓库目录载入插件，用不着测试环境那份。
+# 测试环境里若残留 tests/，会被下面的「删掉仓库已不存在的文件」一并清掉。
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,8 +35,14 @@ fi
 
 total=0
 for name in "${targets[@]}"; do
-    mapfile -d '' -t files < <(git_q ls-files -z -- "$name")
-    [ "${#files[@]}" -gt 0 ] || { echo "✗ $name 未被 git 跟踪，跳过" >&2; continue; }
+    mapfile -d '' -t tracked < <(git_q ls-files -z -- "$name")
+    [ "${#tracked[@]}" -gt 0 ] || { echo "✗ $name 未被 git 跟踪，跳过" >&2; continue; }
+    files=()
+    skipped=0
+    for rel in "${tracked[@]}"; do
+        case "$rel" in "$name"/tests/*) skipped=$((skipped + 1)); continue ;; esac
+        files+=("$rel")
+    done
 
     dest="$TEST_PLUGINS/$name"
     # 先删掉测试目录里仓库已不存在的文件（data/ 与字节码缓存除外）
@@ -60,7 +72,9 @@ for name in "${targets[@]}"; do
             exit 1
         fi
     done
-    echo "✓ $name  ${ok}/${#files[@]} 个文件 SHA1 一致"
+    note=''
+    if [ "$skipped" -gt 0 ]; then note="（tests/ 下 ${skipped} 个不同步）"; fi
+    echo "✓ $name  ${ok}/${#files[@]} 个文件 SHA1 一致${note}"
     total=$((total + ok))
 done
 
