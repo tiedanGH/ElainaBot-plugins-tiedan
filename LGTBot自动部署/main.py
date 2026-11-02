@@ -6,14 +6,17 @@
     /upload force [文件夹名]    仅主人: 跳过内容审核与查重直传 (force 可简写 f)
     /upload help               查看指令帮助
     /compile <文件夹名>         重新编译 (仅上次是临时性编译失败时可用, 无需重传)
-    /download <文件夹名>        仅主人: 把 lgtbot 下的游戏目录打包成 zip 发回 (群聊、私聊都能用)
+    /download <文件夹名>        把 lgtbot 下的游戏目录打包成 zip 发回 (主人私聊也能用)
 
-打包下载 (app/download.py): 走框架 event.reply_file (官方富媒体接口 file_type=4, 群与单聊
-都可用, 单个文件上限 200MB, 另有每日发送文件容量上限 —— 错误码 40093002)。zip 里套一层
-<目录名>/, 与 /upload 收的结构一致, 改完能原样传回去; 符号链接一律不打包 (可能指到游戏
-目录以外); zip 只在内存里拼, 不在插件目录落盘。在群里发就是全群可下, 不想公开源码就私聊 bot。
-框架会把发出的媒体在自己的 data/media/ 里留一份 (网页日志用, 要登录面板才能访问, 默认
-3 天后自动清理)。
+打包下载 (app/download.py): 所有人可用 —— 主人哪儿都能用, 其他人只在「生效范围」的群里;
+上传目录下的每个游戏目录 (上游自带的、别人传的) 对这些群里的人都是公开的。走框架
+event.reply_file (官方富媒体接口 file_type=4, 群与单聊都可用, 单个文件上限 200MB, 另有整个
+机器人共享的每日发送文件容量上限 —— 错误码 40093002), 所以同一时间只处理一个, 每人两次
+之间隔 60 秒 (主人不受限)。zip 里套一层 <目录名>/, 与 /upload 收的结构一致, 改完能原样
+传回去; 群里看得到的 zip 文件名只在目录名过了审 (或是上游自带 / 管理员手放) 时用目录名,
+否则用 lgtbot_game.zip。符号链接一律不打包 (可能指到游戏目录以外); zip 只在内存里拼,
+不在插件目录落盘。框架会把发出的媒体在自己的 data/media/ 里留一份 (网页日志用, 要登录
+面板才能访问, 默认 3 天后自动清理)。
 
 内容查重 (app/flow.py): 下载后按 sha256 比对历史记录, 字节完全一致的包**直接拒收**
 且不进审核 —— 内容一个字节没改, 重传不会得出不同结论。提示里给出上次的记录号与
@@ -218,7 +221,7 @@ __plugin_meta__ = {
     'name': 'LGTBot 自动部署',
     'author': '铁蛋',
     'description': '/upload 引用群文件上传到 lgtbot 目录, 自动内容审核 + 请求编译 + 目录权限管理',
-    'version': '1.19.0',
+    'version': '1.19.1',
 }
 
 log = get_logger(PLUGIN, 'LGTBot自动部署')
@@ -260,10 +263,11 @@ async def cmd_recompile(event, match):
     await flow.handle_recompile(event, (match.group(1) or '').strip())
 
 
-# 打包下载: 仅主人 (框架 owner_only 把关)。不设 group_only —— 私聊 bot 也能用
+# 打包下载: 所有人可用。不设 group_only —— 主人私聊 bot 也能用; 其他人只在「生效范围」的
+# 群里生效, 由 download.handle 把关 (与 /upload 一样, 别处静默)
 @handler(r'^/?download(?:\s+([\s\S]+))?$', name='LGTBot打包下载',
-         desc='/download <文件夹名> — 把 lgtbot 下的游戏目录打包成 zip 发回 (仅主人)',
-         owner_only=True, ignore_at_check=True, priority=5, block=True)
+         desc='/download <文件夹名> — 把 lgtbot 下的游戏目录打包成 zip 发回',
+         ignore_at_check=True, priority=5, block=True)
 async def cmd_download(event, match):
     await download.handle(event, (match.group(1) or '').strip())
 

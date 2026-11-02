@@ -45,8 +45,10 @@ LGTBot 会转发的文字同样算群消息: 计划重启的维护原因会出�
 - 部署错误 `deploy._out(..., error=群里的说法, detail=明细)`; `deploy.bad_name` 与 `check_target` 的返回会进群, 不带名字与路径
 - 违规位置 `flow._finding_lines(record, public=True)`: 只点名 `flow._KNOWN_FILES` 与必需文件清单里的固定文件名, 其余写「其他文件」
 - 编译 API 的报错进群前经 `flow._compile_reason` 把目录名换掉
-- `/download` (仅主人, `app/download.py`): 回复文案同样不复述参数; 发出的 zip 用游戏目录名作文件名 ——
-  只有主人能触发, 而且名字必须对上上传目录里已有的目录 (服务器上的东西, 不是随手打进来的字)
+- `/download` (所有人可用, `app/download.py`): 回复文案同样不复述参数; 发出的 zip 文件名会显示在
+  群里的文件卡片上, 由 `download._zip_name` 决定 —— 最近一次落地的记录过了审 (`flow._reviewed`)
+  或者根本没有上传记录 (上游自带 / 管理员手放, 不是群友打的字) 才用目录名, 其余 (force / skip)
+  一律用中性的 `lgtbot_game.zip`
 
 ### 改完自查
 
