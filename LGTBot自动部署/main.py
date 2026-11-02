@@ -6,6 +6,14 @@
     /upload force [文件夹名]    仅主人: 跳过内容审核与查重直传 (force 可简写 f)
     /upload help               查看指令帮助
     /compile <文件夹名>         重新编译 (仅上次是临时性编译失败时可用, 无需重传)
+    /download <文件夹名>        仅主人: 把 lgtbot 下的游戏目录打包成 zip 发回 (群聊、私聊都能用)
+
+打包下载 (app/download.py): 走框架 event.reply_file (官方富媒体接口 file_type=4, 群与单聊
+都可用, 单个文件上限 200MB, 另有每日发送文件容量上限 —— 错误码 40093002)。zip 里套一层
+<目录名>/, 与 /upload 收的结构一致, 改完能原样传回去; 符号链接一律不打包 (可能指到游戏
+目录以外); zip 只在内存里拼, 不在插件目录落盘。在群里发就是全群可下, 不想公开源码就私聊 bot。
+框架会把发出的媒体在自己的 data/media/ 里留一份 (网页日志用, 要登录面板才能访问, 默认
+3 天后自动清理)。
 
 内容查重 (app/flow.py): 下载后按 sha256 比对历史记录, 字节完全一致的包**直接拒收**
 且不进审核 —— 内容一个字节没改, 重传不会得出不同结论。提示里给出上次的记录号与
@@ -204,13 +212,13 @@ from core.base.logger import PLUGIN, get_logger
 from core.plugin.decorators import handler, on_load, on_unload
 from core.plugin.web_pages import register_page, unregister_page
 
-from .app import config, flow, store, webapi
+from .app import config, download, flow, store, webapi
 
 __plugin_meta__ = {
     'name': 'LGTBot 自动部署',
     'author': '铁蛋',
     'description': '/upload 引用群文件上传到 lgtbot 目录, 自动内容审核 + 请求编译 + 目录权限管理',
-    'version': '1.18.4',
+    'version': '1.19.0',
 }
 
 log = get_logger(PLUGIN, 'LGTBot自动部署')
@@ -250,6 +258,14 @@ async def cmd_upload(event, match):
          group_only=True, ignore_at_check=True, priority=5, block=True)
 async def cmd_recompile(event, match):
     await flow.handle_recompile(event, (match.group(1) or '').strip())
+
+
+# 打包下载: 仅主人 (框架 owner_only 把关)。不设 group_only —— 私聊 bot 也能用
+@handler(r'^/?download(?:\s+([\s\S]+))?$', name='LGTBot打包下载',
+         desc='/download <文件夹名> — 把 lgtbot 下的游戏目录打包成 zip 发回 (仅主人)',
+         owner_only=True, ignore_at_check=True, priority=5, block=True)
+async def cmd_download(event, match):
+    await download.handle(event, (match.group(1) or '').strip())
 
 
 @on_load
