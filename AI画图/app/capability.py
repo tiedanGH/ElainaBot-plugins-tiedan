@@ -1,4 +1,18 @@
-"""把画图能力注册到中央 AI LLM，供其他插件与模型调用。
+"""本插件自己的对外画图工具：挂在框架的全局钩子上，其他插件直接检索、直接调用，不经过中央 AI LLM。
+
+中央 AI LLM 1.3 起去掉了跨插件共享工具：它的「插件私有工具」只注入注册者自己的请求，
+「公用工具」是在子进程里跑的代码（单次最长 120 秒），都碰不到本插件的配置、历史库和图床。
+框架的 HookManager 是进程内单例、任意字符串都能当钩子名，于是：
+
+    from core.module.hook import get_hook_manager
+    hooks = get_hook_manager()
+    found = await hooks.pipeline('ai_draw.tools', {})        # 检索：found['tools'] 是 OpenAI function 定义
+    reply = await hooks.pipeline('ai_draw.call', {
+        'name': 'draw_image', 'arguments': {'prompt': '一只橘猫'}, 'caller': '我的插件',
+    })
+    result = reply['result']
+
+没人挂钩子时 pipeline 原样返回传入的 dict（没有 tools / result 键），调用方据此判断本插件不在。
 
 审核、限额与留档仍然全部发生在本插件里，调用方只拿到图床链接。
 返回值刻意只给链接和少量元信息：工具结果会回灌进调用方模型的上下文，
@@ -10,6 +24,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import time
 
 from core.base.logger import PLUGIN, get_logger
@@ -17,53 +32,44 @@ from core.base.logger import PLUGIN, get_logger
 from . import central, config as draw_config, fanout, hosting, limiter, media, store
 
 log = get_logger(PLUGIN, 'AI画图')
-SOURCE = 'ai_draw'
-TOOL_ID = 'draw'
-CAPABILITY_KEY = f'{SOURCE}:tool:{TOOL_ID}'
+TOOLS_HOOK = 'ai_draw.tools'
+CALL_HOOK = 'ai_draw.call'
+HOOK_OWNER = 'AI画图'
+TOOL_NAME = 'draw_image'
+# 1 = 1.5~1.7 经中央 AI LLM 共享的 ai_draw:tool:draw；2 = 1.8 起的框架钩子
+INTERFACE = 2
 MAX_IMAGES = 10
-_registered_service = None
+_registered = None
 _sessions: set[asyncio.Task] = set()
 
-_DEFINITION = {
-    'id': TOOL_ID,
-    'name': 'AI 画图',
-    'description': (
-        '根据文字描述生成图片，返回本机图床的图片直链、实测像素宽高（width / height），'
-        '并附一段可直接发送的 QQ Markdown 图片语法（markdown 字段）。'
-        '返回的链接已转存到机器人自己的图床，可以直接发出去；不会给 AI 接口的原始链接。'
-        '默认画 1 张；传 max_images≥2 且 AI 画图开了多图模式时，几条线路同时各画一张，'
-        '到 wait_seconds 为止画好的都放进 images 数组一起返回，没画完的只留档、不会再补给你。'
-        '描述要写清主体、动作、场景、风格；不要传入已有图片链接。'
-        '图片由 AI 画图插件统一做内容审核与留档，失败时返回 ok=false 与原因。'
-    ),
-    'config': {
-        'schema': {
+# 给调用方模型看的定义（OpenAI function 格式，可直接当 complete() 的调用级工具）。
+# 只放模型该决定的参数；留档标注、多图等待、张数上限由调用方放在钩子外层。
+TOOL = {
+    'type': 'function',
+    'function': {
+        'name': TOOL_NAME,
+        'description': (
+            '根据文字描述生成图片，返回本机图床的图片直链、实测像素宽高（width / height），'
+            '并附一段可直接发送的 QQ Markdown 图片语法（markdown 字段）。'
+            '返回的链接已转存到机器人自己的图床，可以直接发出去；不会给 AI 接口的原始链接。'
+            '默认画 1 张；max_images≥2 且 AI 画图开了多图模式时，几条线路同时各画一张，'
+            '画好的都放进 images 数组一起返回，没画完的只留档、不会再补给你。'
+            '描述要写清主体、动作、场景、风格；不要传入已有图片链接。'
+            '图片由 AI 画图插件统一做内容审核与留档，失败时返回 ok=false 与原因。'
+        ),
+        'parameters': {
             'type': 'object',
             'properties': {
                 'prompt': {
                     'type': 'string',
                     'description': '画面描述，中文英文均可',
                 },
-                'caller': {
-                    'type': 'string',
-                    'description': '调用方名称，仅用于留档标注（自报，不做鉴权）',
-                },
                 'max_images': {
                     'type': 'integer',
                     'minimum': 1,
                     'maximum': MAX_IMAGES,
                     'description': (
-                        '最多要几张，默认 1。≥2 时启用多图：勾了「多图」的线路同时各画一张；'
-                        'AI 画图没开多图模式、或没配好两条以上多图线路时按 1 张处理'
-                    ),
-                },
-                'wait_seconds': {
-                    'type': 'integer',
-                    'minimum': 10,
-                    'maximum': 280,
-                    'description': (
-                        '多图最多等多少秒就返回，默认取 AI 画图面板的「多图汇总等待」。'
-                        '要比调用方自己的超时短，否则调用方先超时就一张也拿不到'
+                        '最多要几张，默认 1。AI 画图没开多图模式、或多图线路不足两条时按 1 张处理'
                     ),
                 },
             },
@@ -460,10 +466,8 @@ async def _drive(session: _Session, arguments: dict) -> None:
         session.reply({'ok': False, 'error': f'画图能力执行异常：{error}'[:300]})
 
 
-async def handle(capability_id: str, arguments: dict) -> dict:
-    """中央模块的能力入口；任何异常都收敛成 ok=false，不往模型里抛栈。"""
-    if str(capability_id or '') != TOOL_ID:
-        return {'ok': False, 'error': '未知能力'}
+async def draw(arguments: dict) -> dict:
+    """对外画图入口；任何异常都收敛成 ok=false，不往调用方的模型里抛栈。"""
     session = _Session()
     task = asyncio.create_task(_drive(session, arguments if isinstance(arguments, dict) else {}))
     _sessions.add(task)
@@ -477,6 +481,44 @@ async def handle(capability_id: str, arguments: dict) -> dict:
         raise
 
 
+async def _on_tools(data):
+    """钩子「检索」：给出本插件对外的工具定义，可直接当 complete() 的调用级工具。"""
+    current = draw_config.load()
+    multi = central.multi_routes(current)
+    return {
+        **(data if isinstance(data, dict) else {}),
+        'plugin': 'AI画图',
+        'interface': INTERFACE,
+        'call_hook': CALL_HOOK,
+        'tools': [copy.deepcopy(TOOL)],
+        'limits': {
+            'max_images': len(multi) if len(multi) >= 2 else 1,
+            'default_wait_seconds': current['multi_wait_seconds'],
+            'hosting_ready': hosting.available(),
+        },
+    }
+
+
+async def _on_call(data):
+    """钩子「调用」：模型给的参数放 arguments；留档标注、多图等待、张数上限在外层，模型改不了。"""
+    if not isinstance(data, dict):
+        return data
+    name = str(data.get('name') or '')
+    if name != TOOL_NAME:
+        return {**data, 'result': {'ok': False, 'error': f'AI 画图没有名为 {name or "（空）"} 的工具'}}
+    arguments = dict(data['arguments']) if isinstance(data.get('arguments'), dict) else {}
+    arguments['caller'] = str(data.get('caller') or arguments.get('caller') or '')
+    if data.get('wait_seconds') not in (None, ''):
+        arguments['wait_seconds'] = data['wait_seconds']
+    if data.get('max_images') not in (None, ''):
+        # 外层的 max_images 是调用方定的上限：模型要得再多也不超过它
+        arguments['max_images'] = min(
+            _int_in(arguments.get('max_images'), 1, 1, MAX_IMAGES),
+            _int_in(data['max_images'], 1, 1, MAX_IMAGES),
+        )
+    return {**data, 'result': await draw(arguments)}
+
+
 async def shutdown() -> None:
     """插件卸载时收掉还在跑的会话：不留没人管的出图任务，已出的图照常留档。"""
     tasks = [task for task in _sessions if not task.done()]
@@ -486,60 +528,62 @@ async def shutdown() -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-def register() -> bool:
-    """把画图工具注册到中央模块；共享范围由 AI LLM 面板控制。"""
-    global _registered_service
-    service = central.get_service()
-    if service is None or not hasattr(service, 'register_plugin_capability'):
-        return False
+def _hooks():
+    """框架的全局 HookManager；取不到时返回 None。"""
     try:
-        service.register_plugin_capability(SOURCE, 'tool', dict(_DEFINITION), handle)
-    except Exception:  # noqa: BLE001 - 注册失败不影响插件其余功能
-        log.exception('注册画图能力失败')
+        from core.module.hook import get_hook_manager
+
+        return get_hook_manager()
+    except Exception:  # noqa: BLE001 - 取不到就当没有对外能力
+        return None
+
+
+def _online(manager) -> bool:
+    try:
+        entries = manager.list_hooks().get(CALL_HOOK, [])
+    except Exception:  # noqa: BLE001 - 状态查询失败按未挂上处理
         return False
-    if service is not _registered_service:
-        log.info('画图能力已注册到中央 AI LLM：%s', CAPABILITY_KEY)
-    _registered_service = service
+    return any(item.get('owner') == HOOK_OWNER for item in entries)
+
+
+def register() -> bool:
+    """把画图工具挂到框架钩子上；重复调用无副作用。"""
+    global _registered
+    manager = _hooks()
+    if manager is None:
+        return False
+    if _registered is manager and _online(manager):
+        return True
+    # 热重载后旧模块的回调可能还挂着：按 owner 先摘干净再挂新的，免得同一个请求被画两遍
+    manager.unregister_owner(HOOK_OWNER)
+    manager.register(TOOLS_HOOK, _on_tools, owner=HOOK_OWNER)
+    manager.register(CALL_HOOK, _on_call, owner=HOOK_OWNER)
+    _registered = manager
+    log.info('画图工具已挂到框架钩子：%s / %s', TOOLS_HOOK, CALL_HOOK)
     return True
 
 
 def unregister() -> None:
-    global _registered_service
-    service = _registered_service or central.get_service()
-    if service is not None and hasattr(service, 'unregister_plugin_capabilities'):
-        try:
-            service.unregister_plugin_capabilities(SOURCE)
-        except Exception:  # noqa: BLE001 - 卸载阶段不再抛错
-            log.exception('注销画图能力失败')
-    _registered_service = None
+    global _registered
+    manager = _registered or _hooks()
+    if manager is not None:
+        manager.unregister_owner(HOOK_OWNER)
+    _registered = None
 
 
 def sync(enabled: bool) -> bool:
-    """按开关注册或下线；中央模块重载后由看护任务重新注册。"""
+    """按「公开画图工具」开关挂上或摘下。"""
     if enabled:
         return register()
-    if _registered_service is not None:
-        unregister()
+    unregister()
     return False
 
 
 def state() -> dict:
-    service = central.get_service()
-    online = False
-    shared = False
-    if service is not None and hasattr(service, 'plugin_capabilities'):
-        try:
-            item = next((
-                value for value in service.plugin_capabilities()
-                if value.get('key') == CAPABILITY_KEY
-            ), None)
-        except Exception:  # noqa: BLE001 - 状态查询失败按未注册处理
-            item = None
-        if item is not None:
-            online = bool(item.get('online'))
-            shared = bool(item.get('shared')) and bool(item.get('enabled'))
-    # 对外调用一定要过图床，图床不可用时这个工具必然失败，面板要能提前看到。
+    manager = _hooks()
     return {
-        'key': CAPABILITY_KEY, 'online': online, 'shared': shared,
+        'tools_hook': TOOLS_HOOK, 'call_hook': CALL_HOOK, 'tool': TOOL_NAME,
+        'online': manager is not None and _online(manager),
+        # 对外调用一定要过图床，图床不可用时这个工具必然失败，面板要能提前看到。
         'hosting_ready': hosting.available(),
     }

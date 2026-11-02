@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import os
 import time
 
@@ -17,7 +16,7 @@ __plugin_meta__ = {
     'name': 'AI 画图',
     'author': '铁蛋',
     'description': '所有人可用的「画图 XXX」指令，调用中央 AI LLM 生图，并提供配置与历史记录面板',
-    'version': '1.7.1',
+    'version': '1.8.0',
     'license': 'MIT',
 }
 
@@ -25,7 +24,6 @@ log = get_logger(PLUGIN, 'AI画图')
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, 'data')
 PAGE_KEY = 'ai-draw'
-_capability_task: asyncio.Task | None = None
 # 只做群聊与 QQ 私聊。频道（含频道私信）的事件干脆不注册：handler 带 block=True，
 # 注册了即使直接 return 也会把频道里的「画图」从别的插件手里吞掉。
 MESSAGE_EVENTS = [
@@ -63,36 +61,19 @@ async def initialize() -> None:
         icon=_ICON,
         html_file=os.path.join(BASE_DIR, 'panel.html'),
     )
-    global _capability_task
-    if _capability_task is None or _capability_task.done():
-        _capability_task = asyncio.create_task(_watch_capability())
+    # 对外画图工具挂在框架钩子上，跟着插件的加载 / 卸载走，开关改了由面板保存时同步
+    capability.sync(config.load()['capability_enabled'])
     log.info('AI 画图插件已加载')
 
 
 @on_unload
 async def cleanup() -> None:
-    global _capability_task
-    if _capability_task is not None:
-        _capability_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await _capability_task
-        _capability_task = None
     capability.unregister()
     # 对外调用的会话可能还在画：先收尾留档，再关库
     await capability.shutdown()
     unregister_page(PAGE_KEY)
     limiter.reset()
     await asyncio.to_thread(store.close)
-
-
-async def _watch_capability() -> None:
-    """中央模块重载会清空在线能力，这里按开关持续补注册。"""
-    while True:
-        try:
-            capability.sync(config.load().get('capability_enabled', False))
-        except Exception:  # noqa: BLE001 - 看护任务不能被单次失败带崩
-            log.debug('画图能力注册重试失败', exc_info=True)
-        await asyncio.sleep(5)
 
 
 def _is_owner(event) -> bool:

@@ -11,7 +11,7 @@
 
 | 模块 | 必需 | 说明 |
 |---|---|---|
-| `modules/ai_llm` | ✅ | 至少配好一个支持生图的接口与模型 |
+| `modules/ai_llm` | ✅ | 至少配好一个支持生图的接口与模型；对外画图工具不依赖它的工具共享（1.3 已去掉） |
 | `modules/image_hosting` | 推荐 | 出图后上传图床拿直链，才能发 Markdown 图片消息；**对外公开画图能力时必需** |
 
 缺 AI LLM 时面板整体灰化并提示去插件市场下载；缺图床时自动退回富媒体图片消息。
@@ -207,7 +207,7 @@ timeout = aiohttp.ClientTimeout(total=min(180, max(30, self._config['request_tim
 | 不进任何日志 | 请求头就地构造，从不打印 payload / headers |
 | 不进任何报错 | 外抛文本一律过 `_scrub()`，连中转把密钥回显在错误体里也会被抹成 `[密钥已隐藏]` |
 | 不落盘 | 每次调用现取现用，插件配置与历史库都不存 |
-| 只支持 OpenAI 兼容接口 | `api_type` 为 `gemini` 等原生类型时明确拒绝，不猜请求格式 |
+| 只支持 OpenAI 兼容格式 | `openai_responses`、`gemini` 原生、`novelai` 明确拒绝，不猜请求格式；`gemini_openai`、`grok` 等兼容类型照常可用，Base URL 填成完整的 `…/chat/completions` 也能用（与中央模块拼地址一致） |
 
 代价：这些调用**不进中央模块的调用审计与 Token 统计**，中央面板看不到这部分用量。
 所以定位成调试功能——等中央模块支持了 `message.images`，关掉开关即可回到正常链路。
@@ -218,37 +218,69 @@ timeout = aiohttp.ClientTimeout(total=min(180, max(30, self._config['request_tim
 
 ## 对外公开画图能力
 
-把画图注册成中央 AI LLM 的**插件工具**，其他插件与它们的模型都能直接调用，
-而**审核、限额、留档仍然全部发生在本插件里**。
+画图是**本插件自己的对外工具**：挂在框架的全局钩子（`core.module.hook.get_hook_manager()`）上，
+其他插件直接检索、直接调用，**不经过中央 AI LLM**；审核、限额、留档仍然全部发生在本插件里。
+
+> 1.5 ~ 1.7 是把工具注册到中央 AI LLM 共享（`ai_draw:tool:draw` + `call_capability()`）。
+> 中央 1.3 起去掉了跨插件共享：它的「插件私有工具」只注入注册者自己的请求，「公用工具」是在子进程里
+> 跑的代码（单次最长 120 秒），碰不到本插件的配置、历史库和图床。所以 1.8 起改走框架钩子，
+> 也就不再受中央模块版本影响。
+
+| 钩子 | 用法 | 作用 |
+|---|---|---|
+| `ai_draw.tools` | `pipeline` | **检索**：返回 `tools`（OpenAI function 定义）、`call_hook`、`limits` |
+| `ai_draw.call` | `pipeline` | **调用**：按工具名执行，结果放在返回 dict 的 `result` 里 |
 
 ```python
-# 其他插件：让模型自己决定要不要画
+from core.module.hook import get_hook_manager
+
+hooks = get_hook_manager()
+found = await hooks.pipeline('ai_draw.tools', {})
+tools = found.get('tools', [])        # [{'type': 'function', 'function': {'name': 'draw_image', ...}}]
+
+reply = await hooks.pipeline('ai_draw.call', {
+    'name': 'draw_image',
+    'arguments': {'prompt': '一只橘猫'},   # 模型给的参数原样转交
+    'caller': 'my_plugin',                 # 留档标注
+})
+result = reply.get('result') or {'ok': False, 'error': 'AI 画图没有响应'}
+```
+
+检索到的定义可以直接当中央 `complete()` 的**调用级工具**，让自己的模型决定要不要画：
+
+```python
+async def tool_handler(name, arguments):
+    reply = await hooks.pipeline('ai_draw.call', {
+        'name': name, 'arguments': arguments, 'caller': 'my_plugin', 'max_images': 1,
+    })
+    return reply.get('result') or {'ok': False, 'error': 'AI 画图没有响应'}
+
 result = await service.complete(
-    messages, consumer_plugin='my_plugin', runtime_capabilities=['tool'],
-)
-
-# 或者直接调
-result = await service.call_capability(
-    'my_plugin', capability_key='ai_draw:tool:draw', arguments={'prompt': '一只橘猫'},
-)
-
-# 要多张：几条多图线路同时画，最多等 100 秒
-result = await service.call_capability(
-    'my_plugin', capability_key='ai_draw:tool:draw',
-    arguments={'prompt': '一只橘猫', 'max_images': 3, 'wait_seconds': 100},
+    messages, tools=tools, tool_handler=tool_handler, consumer_plugin='my_plugin',
+    tool_timeout=300,   # 中央默认 120 秒就掐断工具并终止整次调用，画图常常更久
 )
 ```
 
+没人挂钩子时 `pipeline` 原样返回传入的 dict（没有 `tools` / `result` 键），据此判断本插件没装、
+没加载或关了「公开画图工具」；也可以先看 `hooks.has('ai_draw.call')`。
+
 ### 参数
 
-| 参数 | 必填 | 说明 |
-|---|---|---|
-| `prompt` | ✅ | 画面描述 |
-| `caller` | | 调用方名称，只用于留档标注 |
-| `max_images` | | 最多几张，默认 `1` = 单图（与 1.6 及以前完全一致）；`≥2` 且本插件开了多图模式时启用多图，上限是勾了多图的可用线路数 |
-| `wait_seconds` | | 多图最多等多少秒就返回，默认取面板「多图汇总等待」，范围 10~280 |
+模型能填的只有 `arguments` 里的两项；其余由调用方放在外层，模型改不了：
 
-不传 `max_images` 就还是单图：老调用方**不改代码也照常工作**，也不会被悄悄改成一次画好几张、多花钱。
+| 位置 | 字段 | 必填 | 说明 |
+|---|---|---|---|
+| `arguments` | `prompt` | ✅ | 画面描述 |
+| `arguments` | `max_images` | | 最多几张，默认 `1` = 单图；`≥2` 且本插件开了多图模式时启用多图，上限是勾了多图的可用线路数 |
+| 外层 | `name` | ✅ | 检索到的工具名（`draw_image`） |
+| 外层 | `caller` | | 调用方名称，只用于留档标注 |
+| 外层 | `max_images` | | 调用方定的张数**上限**：模型要得再多也不超过它（钉死单图就传 `1`） |
+| 外层 | `wait_seconds` | | 多图最多等多少秒就返回，默认取面板「多图汇总等待」，范围 10~280 |
+
+不传 `max_images` 就是单图，不会被悄悄改成一次画好几张、多花钱。
+
+`ai_draw.tools` 另外返回 `limits`：`max_images`（当前最多能同时画几张，多图没开时是 1）、
+`default_wait_seconds`、`hosting_ready`（图床不可用时对外调用必然失败）。
 
 ### 返回值
 
@@ -306,21 +338,23 @@ result = await service.call_capability(
 （记「调用方已超时离开，图片只留档」），不会把已经在画的图扔掉；但不再换线路重试、
 也不再占图床额度 —— 没人收了。插件卸载时还在跑的会话会被收掉，已出的图照样留档。
 
-### 为插件适配新接口
+### 调用方怎么接
 
-不改也能用（默认单图）。要多张时调用方改三处：
+从 1.7 的 `call_capability()` 迁过来只改「怎么找到、怎么调」，参数和返回体不变：
 
 ```python
-# 1. 请求：加 max_images；wait_seconds 比自己的超时短 10 秒以上
+# 1. 调用：经框架钩子；wait_seconds 比自己的超时短 10 秒以上
 timeout = float(current.get('draw_timeout_seconds') or 120)
-call = service.call_capability(
-    consumer_plugin=CONSUMER, capability_key=str(item['key']),
-    arguments={'prompt': prompt, 'caller': CALLER,
-               'max_images': 3, 'wait_seconds': max(10, int(timeout) - 15)},
-)
-result = await asyncio.wait_for(call, timeout)
+hooks = get_hook_manager()
+if not hooks.has('ai_draw.call'):
+    return {'ok': False, 'error': 'AI 画图没装、没加载或没开「公开画图工具」'}
+reply = await asyncio.wait_for(hooks.pipeline('ai_draw.call', {
+    'name': 'draw_image', 'arguments': {'prompt': prompt}, 'caller': CALLER,
+    'max_images': 3, 'wait_seconds': max(10, int(timeout) - 15),
+}), timeout)
+result = reply.get('result') or {'ok': False, 'error': 'AI 画图没有响应'}
 
-# 2. 读结果：images 永远是数组；兼容 1.6 及以前只有顶层 url 的返回
+# 2. 读结果：images 永远是数组
 images = result.get('images') or ([result] if result.get('url') else [])
 for item in images:
     url = item['url']
@@ -380,13 +414,12 @@ await event.reply(text, msg_type=2, skip_suffix=True, force_verify_image_resourc
 | 留档 | 记录 `source=capability`，运行日志里能单独筛出来 |
 | 失败 | 一律返回 `ok=false` + 原因，绝不把异常栈抛进模型 |
 
-中央模块的 handler 签名是 `handler(capability_id, arguments)`，**拿不到 Event**，
-所以做不了按用户的冷却与配额——`caller` 参数是调用方自报的，只用于留档标注，不做鉴权。
-真正的成本闸是上面那个每日上限。
+钩子调用**拿不到 Event**，所以做不了按用户的冷却与配额——`caller` 是调用方自报的，
+只用于留档标注，不做鉴权。真正的成本闸是上面那个每日上限。
 
-共享范围由 **AI LLM 面板**控制（工具默认对所有插件共享，可改成仅指定插件）。
-本插件的开关只负责「注册 / 不注册」。中央模块重载会清空在线能力，插件有个 5 秒的
-看护任务会自动补注册。
+钩子是进程内全局的：开着「公开画图工具」时，**同一机器人进程里的任何插件**都能检索与调用
+（不再有中央面板的授权名单）；关掉开关即摘下。插件加载时挂上、卸载或热重载时按 owner
+（`AI画图`）摘下，热重载不会留下两份回调。
 
 ---
 
@@ -488,7 +521,7 @@ AI画图/
     ├── config.py        配置读写 (data/config.json, 原子替换)
     ├── central.py       中央 AI LLM 适配: 接口目录 / 改写 / 审核 / 生图
     ├── hosting.py       Image Hosting 适配: 上传取直链
-    ├── capability.py    对外画图工具: 注册到中央 AI LLM 供其他插件调用
+    ├── capability.py    对外画图工具: 挂到框架钩子供其他插件检索与调用
     ├── fanout.py        多图并发调度: 同时出图 / 取字节 / 转存图床 / 逐张留档
     ├── media.py         图片格式识别、尺寸解析、公网下载
     ├── limiter.py       冷却 / 每日配额 / 并发闸

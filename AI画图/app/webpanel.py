@@ -73,6 +73,7 @@ async def _save_config(request: web.Request) -> web.Response:
                     {'success': False, 'error': _MULTI_NEEDS_TWO}, status=400,
                 )
         value = await asyncio.to_thread(config.save, body)
+        capability.sync(value['capability_enabled'])
         requested = str(value.get('prompt_provider_id') or '')
         resolved, model = central.resolve_selection(
             requested, str(value.get('prompt_model') or ''),

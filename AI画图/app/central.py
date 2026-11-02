@@ -25,6 +25,9 @@ _MARKDOWN_IMAGE = re.compile(r'!\[[^\]]*\]\(\s*(\S+?)\s*\)')
 _BARE_URL = re.compile(r'https?://\S+\.(?:png|jpe?g|webp|gif)(?:\?\S*)?', re.IGNORECASE)
 _BEARER = re.compile(r'(?i)\bBearer\s+[A-Za-z0-9._~+\-/=]+')
 _CHAT_IMAGE_MAX_TOKENS = 65536
+# 这几类接口的请求格式与 OpenAI 不同（Responses / Gemini 原生 / NovelAI），插件直连不猜格式；
+# 中央 1.3 新增的 gemini_openai、grok 等类型走的是 OpenAI 兼容格式，照常可用。
+_DIRECT_UNSUPPORTED = {'openai_responses', 'gemini', 'novelai'}
 # 中转明确回「这个模型不在 images 端点上」时，不必等管理员去面板改开关，直接改走对话端点。
 _IMAGES_ENDPOINT_REJECTED = re.compile(
     r'(?:not\s+supported|unsupported|does\s+not\s+support|不支持)[^\n]{0,120}?images?/(?:generations|edits)'
@@ -330,9 +333,13 @@ def _direct_endpoint(config: dict, provider_id: str, *,
     if provider is None:
         raise RuntimeError('接口不存在或未启用')
     api_type = str(provider.get('api_type') or 'openai_compatible')
-    if api_type not in {'openai', 'openai_compatible'}:
-        raise RuntimeError(f'插件直连只支持 OpenAI 兼容接口，当前接口类型是 {api_type}')
+    if api_type in _DIRECT_UNSUPPORTED:
+        raise RuntimeError(f'插件直连只支持 OpenAI 兼容格式的接口，当前接口类型是 {api_type}')
     base_url = str(provider.get('base_url') or '').strip().rstrip('/')
+    # 与中央模块拼地址的规则一致：Base URL 填成完整的 …/chat/completions 也能用
+    for suffix in ('/chat/completions', '/responses'):
+        if base_url.endswith(suffix):
+            base_url = base_url[:-len(suffix)]
     api_key = str(provider.get('api_key') or '')
     if not base_url or not api_key:
         raise RuntimeError('该接口缺少 Base URL 或 API Key，无法直连')
