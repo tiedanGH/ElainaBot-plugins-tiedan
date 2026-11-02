@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import shutil
 import time
 
@@ -26,6 +27,12 @@ from . import store
 
 _ARCHIVE_SUFFIXES = ('.tar.gz', '.tar.bz2', '.tar.xz', '.tgz', '.tbz2', '.txz',
                      '.tar', '.zip', '.rar', '.7z')
+
+# 新游戏目录名: LGTBot 编译时把目录名当 C++ 命名空间用 (games/CMakeLists.txt 定义
+# GAME_MODULE_NAME=<目录名>, 游戏代码里写 namespace GAME_MODULE_NAME {...}), 所以必须是
+# 标识符 —— - . 空格与中文都编不过; 再按 LGTBot 现有游戏目录的写法限定全小写。
+# 长度上限与编译 API 的目标名白名单一致 (compile._TARGET_RE)
+_GAME_NAME_RE = re.compile(r'[a-z_][a-z0-9_]{0,62}')
 
 
 def strip_archive_ext(name: str) -> str:
@@ -52,6 +59,17 @@ def bad_name(name: str) -> str:
     if any(c in name for c in ':*?"<>|'):
         return '名称含非法字符 (: * ? " < > |)'
     return ''
+
+
+def bad_game_name(name: str) -> str:
+    """新游戏目录名的规范 (见 _GAME_NAME_RE); 返回错误信息, 空串表示合规。
+
+    只管**新建**的目录 (flow.handle 调用): 已有目录的名字早定了, 不拿这条卡它的更新。
+    错误信息同样不带名字本身 —— 会进群。
+    """
+    if _GAME_NAME_RE.fullmatch(name or ''):
+        return ''
+    return '新游戏目录名必须全部小写: 只能用小写字母、数字和下划线 _, 不能以数字开头, 最长 63 个字符'
 
 
 def check_target(target: dict) -> str:

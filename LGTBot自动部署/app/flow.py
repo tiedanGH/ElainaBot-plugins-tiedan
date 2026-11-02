@@ -82,6 +82,7 @@ def usage() -> str:
         '',
         '🔸上传需引用一条群文件消息, 审核通过后自动落地',
         '🔸压缩包: 解压至 lgtbot 下的同名文件夹, 重名文件夹直接替换',
+        '🔸新游戏的目录名就是压缩包名, 必须全部小写 (小写字母、数字、下划线 _, 不以数字开头)',
         '🔸单文件: 写入 lgtbot 下已存在的指定文件夹, 重名文件直接替换',
         '🔸压缩包支持 zip / tar.gz / tar.bz2 / tar.xz',
     ]
@@ -90,7 +91,6 @@ def usage() -> str:
     lines.append('🔸不能带 .py 文件与以 . 开头的隐藏文件 (开发脚本请留在本地)')
     lines.append('🔸rule.md 需有原作标注 (改编需注明「改编自 X」)')
     lines.append('🔸新游戏上传成功后目录自动绑定上传者, 此后仅绑定用户可更新该目录')
-    lines.append('🔸内容完全相同的文件会被直接拒收; 只是编译失败请用 /compile 重编')
     return '\n'.join(lines)
 
 
@@ -225,6 +225,13 @@ async def handle(event, argline: str, force: bool = False) -> bool:
                                '仅绑定用户可更新该目录, 如需变更请联系管理员')
             return False
     is_new = (not folder) and not exists
+    # 新游戏的目录名 (= 压缩包名) 要合规范 (deploy.bad_game_name), force 也一样 —— 编译认它。
+    # 已有的目录与暂存待重编的 (held) 不查: 名字早定了, 不拿新规矩卡它们的更新
+    if is_new and not held:
+        name_err = deploy.bad_game_name(game)
+        if name_err:
+            await _send(event, f'❌ {name_err}\n且目录名需和压缩包名一致, 请重命名压缩包后重新上传')
+            return False
 
     # 以下判定 → 置位 → 建任务之间不能有 await, 否则并发指令会一起受理
     global _busy
@@ -365,8 +372,13 @@ async def _pipeline(event, cfg: dict, ref: dict, record: dict, target: dict, fol
     # 查重是替普通上传者省一轮无谓的审核, 而主人重传同一个包往往正是**想要**的
     # (服务器侧出过状况需要重新落地一次, 而删记录只为绕开一道限制未免太绕)。
     # 仍然算出并记下 sha256: 后续记录要靠它查重, 少记一条会让下次重传漏检。
+    #
+    # 上传方式 (压缩包 / 单文件) 不同的也不算重复: 上次多半是方式用错了 —— 比如整个游戏的
+    # 压缩包当单文件传了 —— 换对方式重传, 字节一样, 处理方式与结论却都不一样。
     record['sha256'] = hashlib.sha256(data).hexdigest()
-    dup = None if force else store.find_by_sha(record['sha256'], rid, accept=_settled)
+    mode = record['mode']
+    dup = None if force else store.find_by_sha(
+        record['sha256'], rid, accept=lambda r: _settled(r) and r.get('mode') == mode)
     if dup:
         record.update(stage='duplicate',
                       error=f'与记录 {dup.get("id")} 完全一致 (SHA256 相同), '
@@ -423,6 +435,17 @@ async def _pipeline(event, cfg: dict, ref: dict, record: dict, target: dict, fol
                                       reason='压缩包损坏或格式不受支持')
         record['total_size'] = info['total_size']
         record['root'] = info['root']
+        # 包里套了一层文件夹, 就得与压缩包同名 (force 也一样): 同名的那层落地时会被提上来
+        # (deploy_archive), 不同名就落成 <压缩包名>/<文件夹名>/..., mygame.cc 不在游戏目录顶层。
+        # 两个名字都是上传者起的, 群里只说不一致, 具体名字只进记录
+        base = deploy.strip_archive_ext(fname)
+        if info['root'] and info['root'] != base:
+            record.update(stage='name',
+                          error=f'压缩包名「{base}」与包内文件夹名「{info["root"]}」不一致')
+            return await _finish_fail(
+                event, cfg, record, '名称不一致, 已拒收', notify=False,
+                reason='压缩包名与包内文件夹名不一致',
+                suffix='请把压缩包与包内的文件夹改成同一个名字 (即游戏目录名) 后重新上传')
 
         # 4) 采集送审内容 (仅文字)
         pkg = await asyncio.to_thread(archive.collect, staging, limits)
@@ -1322,7 +1345,7 @@ async def _run_recompile(event, cfg: dict, game: str, last: dict):
 _STAGE_TEXT = {
     'received': '未处理完', 'download': '下载失败', 'extract': '解压或校验失败',
     'integrity': '压缩包不完整', 'hidden': '含隐藏文件被拒', 'script': '含 .py 文件被拒',
-    'review': '审核阶段结束', 'deploy': '部署失败',
+    'name': '名称不一致被拒', 'review': '审核阶段结束', 'deploy': '部署失败',
     'deployed': '已部署', 'duplicate': '重复上传被拒', 'recompile': '重新编译',
     'error': '处理异常', 'cancelled': '任务被取消',
 }
@@ -1337,11 +1360,12 @@ def _settled(rec: dict) -> bool:
     插件或服务自己出的状况不算 —— 内容根本没得出结论, 重传正是出路: 任务被取消 (热重载
     / 重启, 已落地被收拾成暂存的那种也算)、处理异常、下载失败、部署时写盘出错、审核服务
     异常 (重试耗尽)。重复上传被拒的记录也跳过: 它只是指着更早那条, 跳过才找得到真正的结论。
+    名称不一致被拒的也不算: 拦的是压缩包名而不是内容 —— 改个压缩包名重传, 字节一个没变。
     """
     if rec.get('cancelled') or rec.get('error') == _CANCELLED or rec.get('manual'):
         return False
     return (rec.get('stage') or '') not in ('duplicate', 'cancelled', 'error', 'received',
-                                            'download', 'deploy')
+                                            'download', 'deploy', 'name')
 
 
 def _record_outcome(rec: dict) -> str:
