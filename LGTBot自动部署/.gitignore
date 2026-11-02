@@ -1,2 +1,4 @@
-# 本地测试与历史用例备份
-tests/
+# 测试夹具: 上传者的真实游戏包 (压缩包与解开的目录), 只在本机做备份与回归, 不进仓库;
+# 测试代码、说明与夹具清单 (fixtures/MANIFEST.md) 照常提交
+tests/fixtures/*
+!tests/fixtures/MANIFEST.md
