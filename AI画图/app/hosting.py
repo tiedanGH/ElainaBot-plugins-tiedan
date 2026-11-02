@@ -1,6 +1,11 @@
 """Image Hosting 模块适配层：把生成的图片转成可嵌入 Markdown 的公网直链。"""
 from __future__ import annotations
 
+import time
+import uuid
+
+from . import media
+
 
 def _app():
     try:
@@ -76,6 +81,13 @@ def _extract_url(result) -> str:
         if isinstance(url, str) and url.startswith(('http://', 'https://')):
             return url
     return ''
+
+
+def file_name(data: bytes) -> str:
+    """上传用的文件名：毫秒时间戳 + 随机后缀。COS 这类图床直接拿它拼对象键，
+    多图几路在同一毫秒传完时，不加后缀会互相覆盖成同一张图。
+    """
+    return f'ai-draw-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}.{media.sniff(data)[0]}'
 
 
 async def upload(data: bytes, file_name: str = 'ai-draw.png', *, appid: str = '') -> str:

@@ -40,6 +40,10 @@ DEFAULT_CONFIG = {
     'image_routes': [],
     'image_size': '1024x1024',
     'delivery_max_attempts': 2,
+    # 多图模式：勾了「多图」的线路同时开画，到这个时长（从开始审核算）先把画好的发出去，
+    # 没画完的继续画，在 290 秒内画好就补发。
+    'multi_wait_seconds': 90,
+    'multi_progress_text': '还有 {pending} 张在画，画好会自动补发',
     # ⚠ 调试开关：允许插件绕过中央模块直接向接口发对话请求（需要读取中央模块的密钥）。
     # 默认关闭；关闭时插件在任何代码路径上都不会去取密钥。
     'debug_direct_request': False,
@@ -204,11 +208,17 @@ def validate(value: dict) -> dict:
             'model': model,
             'mode': mode if mode in ROUTE_MODES else 'image',
             'timeout': timeout if timeout == 0 else max(10, timeout),
+            # 多图：与其它勾选了的线路同时开画，而不是失败了才轮到
+            'multi': bool(item.get('multi', False)),
             'enabled': bool(item.get('enabled', True)),
         })
         seen.add(key)
     value['image_routes'] = normalized
     value['delivery_max_attempts'] = _int_in(value.get('delivery_max_attempts'), 2, 1, 5)
+    # 汇总必须早于 290 秒的硬截止，否则没有补发窗口可言
+    value['multi_wait_seconds'] = _int_in(value.get('multi_wait_seconds'), 90, 10, 280)
+    progress = _text(value.get('multi_progress_text'), DEFAULT_CONFIG['multi_progress_text'], 200)
+    value['multi_progress_text'] = progress if '{pending}' in progress else progress + '（{pending} 张）'
 
     value['prompt_provider_id'] = str(value.get('prompt_provider_id') or '').strip()[:128]
     value['prompt_model'] = str(value.get('prompt_model') or '').strip()[:256]

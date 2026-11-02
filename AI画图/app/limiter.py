@@ -75,6 +75,24 @@ def check(config: dict, *, appid: str, user_id: str, chat_id: str, is_owner: boo
     return ''
 
 
+def quota_left(config: dict, *, user_id: str, is_owner: bool) -> int | None:
+    """今天还能出几张：每人每日与全局每日取较小值；没设上限或主人豁免时返回 None。
+
+    多图一次会出好几张，按它削减同时开画的线路数，免得一次请求就把额度冲穿。
+    """
+    if is_owner and config.get('owner_bypass_limits'):
+        return None
+    since = day_start()
+    left = []
+    user_limit = int(config.get('user_daily_limit', 0))
+    if user_limit > 0:
+        left.append(user_limit - store.count_since(since, user_id))
+    global_limit = int(config.get('global_daily_limit', 0))
+    if global_limit > 0:
+        left.append(global_limit - store.count_since(since))
+    return max(0, min(left)) if left else None
+
+
 def release(appid: str, user_id: str, chat_id: str) -> None:
     """请求未真正发起时回退冷却记录，避免占用用户额度。"""
     _user_last.pop(f'{appid}:{user_id}', None)

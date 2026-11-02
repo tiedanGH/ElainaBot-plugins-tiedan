@@ -10,20 +10,30 @@ STATUSES = ('success', 'failed', 'blocked')
 _lock = threading.RLock()
 _connection: sqlite3.Connection | None = None
 _image_dir = ''
+_db_path = ''
+# 同一次请求的记录数：多图会写多条记录（同一个 batch_id），按批次折算成一次请求
+_REQUEST_KEY = "CASE WHEN batch_id<>'' THEN 'b:' || batch_id ELSE 'r:' || id END"
+
+
+def _open(path: str) -> sqlite3.Connection:
+    connection = sqlite3.connect(path, check_same_thread=False)
+    connection.row_factory = sqlite3.Row
+    return connection
 
 
 def connect(data_dir: str) -> None:
-    global _connection, _image_dir
+    global _connection, _image_dir, _db_path
     os.makedirs(data_dir, exist_ok=True)
     _image_dir = os.path.join(data_dir, 'images')
     os.makedirs(_image_dir, exist_ok=True)
+    path = os.path.join(data_dir, 'history.db')
     with _lock:
         if _connection is not None:
-            return
-        _connection = sqlite3.connect(
-            os.path.join(data_dir, 'history.db'), check_same_thread=False,
-        )
-        _connection.row_factory = sqlite3.Row
+            if path == _db_path:
+                return
+            _connection.close()
+        _db_path = path
+        _connection = _open(_db_path)
         _connection.execute('PRAGMA journal_mode=WAL')
         _connection.executescript(
             """
@@ -49,7 +59,8 @@ def connect(data_dir: str) -> None:
                 hosted_url TEXT NOT NULL DEFAULT '',
                 image_file TEXT NOT NULL DEFAULT '',
                 send_mode TEXT NOT NULL DEFAULT '',
-                delivered INTEGER NOT NULL DEFAULT 0
+                delivered INTEGER NOT NULL DEFAULT 0,
+                batch_id TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_ai_draw_created ON records(created_at);
             CREATE INDEX IF NOT EXISTS idx_ai_draw_user ON records(user_id, created_at);
@@ -65,7 +76,7 @@ def _migrate() -> None:
     existing = {
         row['name'] for row in _conn().execute('PRAGMA table_info(records)').fetchall()
     }
-    for column in ('hosted_url', 'send_mode'):
+    for column in ('hosted_url', 'send_mode', 'batch_id'):
         if column not in existing:
             _conn().execute(
                 f"ALTER TABLE records ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
@@ -83,8 +94,16 @@ def close() -> None:
 
 
 def _conn() -> sqlite3.Connection:
+    """取连接。多图一次请求能跑近 5 分钟，期间插件热重载会把这份模块的连接关掉，
+    画到一半的那次请求还得把记录写完，所以连过一次的库在这里按原路径重新打开。
+    """
+    global _connection
     if _connection is None:
-        raise RuntimeError('AI 画图历史库尚未初始化')
+        if not _db_path:
+            raise RuntimeError('AI 画图历史库尚未初始化')
+        with _lock:
+            if _connection is None:
+                _connection = _open(_db_path)
     return _connection
 
 
@@ -107,7 +126,7 @@ def add(record: dict, history_limit: int = 500) -> int:
     fields = (
         'appid', 'user_id', 'username', 'chat_type', 'chat_id', 'source', 'status',
         'prompt', 'final_prompt', 'provider_id', 'provider', 'model', 'size', 'error',
-        'image_url', 'hosted_url', 'image_file', 'send_mode',
+        'image_url', 'hosted_url', 'image_file', 'send_mode', 'batch_id',
     )
     values = [str(record.get(key) or '') for key in fields]
     with _lock:
@@ -267,7 +286,8 @@ def get(record_id: int) -> dict | None:
 
 def query(
     *, status: str = '', keyword: str = '', user_id: str = '', chat_id: str = '',
-    model: str = '', with_image: bool = False, limit: int = 50, offset: int = 0,
+    model: str = '', batch_id: str = '', with_image: bool = False,
+    limit: int = 50, offset: int = 0,
 ) -> dict:
     """分页查询历史记录，供画廊与日志页共用。"""
     where = ['1=1']
@@ -287,6 +307,10 @@ def query(
     if wanted_model:
         where.append('model=?')
         params.append(wanted_model)
+    wanted_batch = str(batch_id or '').strip()[:32]
+    if wanted_batch:
+        where.append('batch_id=?')
+        params.append(wanted_batch)
     if with_image:
         where.append("(image_file<>'' OR hosted_url<>'' OR image_url<>'')")
     value = str(keyword or '').strip()
@@ -323,14 +347,15 @@ def count_since(since: float, user_id: str = '') -> int:
 def stats(day_start: float) -> dict:
     with _lock:
         row = _conn().execute(
-            'SELECT COUNT(*) AS total, '
+            f'SELECT COUNT(DISTINCT {_REQUEST_KEY}) AS total, '
             "SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success, "
             "SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed, "
             "SUM(CASE WHEN status='blocked' THEN 1 ELSE 0 END) AS blocked, "
             'COUNT(DISTINCT user_id) AS users FROM records'
         ).fetchone()
         today = _conn().execute(
-            'SELECT COUNT(*) FROM records WHERE created_at>=?', (float(day_start),),
+            f'SELECT COUNT(DISTINCT {_REQUEST_KEY}) FROM records WHERE created_at>=?',
+            (float(day_start),),
         ).fetchone()[0]
         average = _conn().execute(
             "SELECT AVG(duration_ms) FROM records WHERE status='success' AND duration_ms>0"

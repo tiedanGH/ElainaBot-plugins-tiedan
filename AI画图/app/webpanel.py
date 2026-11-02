@@ -48,6 +48,7 @@ def _with_central(value: dict) -> dict:
     value['shared_ai_status'] = central.status()
     value['shared_ai'] = central.public_config()
     value['valid_routes'] = len(central.valid_routes(value))
+    value['multi_routes'] = len(central.multi_routes(value))
     value['image_sizes'] = list(config.IMAGE_SIZES)
     value['hosting'] = hosting.state()
     value['capability'] = capability.state()
@@ -82,6 +83,7 @@ async def _stats(_request: web.Request) -> web.Response:
     data.update({
         'routes': len(config.enabled_routes(current)),
         'valid_routes': len(central.valid_routes(current)),
+        'multi_routes': len(central.multi_routes(current)),
         'image_size': current['image_size'],
         'enabled': current['enabled'],
         'shared_ai_status': central.status(),
@@ -114,6 +116,7 @@ async def _records(request: web.Request) -> web.Response:
         user_id=str(query.get('user_id') or '')[:80],
         chat_id=str(query.get('chat_id') or '')[:120],
         model=str(query.get('model') or '')[:256],
+        batch_id=str(query.get('batch_id') or '')[:32],
         with_image=str(query.get('with_image') or '') in {'1', 'true'},
         limit=limit,
         offset=offset,

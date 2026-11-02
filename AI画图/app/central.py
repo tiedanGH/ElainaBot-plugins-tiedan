@@ -167,6 +167,26 @@ def provider_name(provider_id: str) -> str:
     return str((provider or {}).get('name') or target)
 
 
+def route_label(route: dict) -> str:
+    """日志与报错里指认线路用的「接口名/模型」。"""
+    return f"{provider_name(route.get('provider_id', ''))}/{route.get('model', '')}"
+
+
+def describe(error: BaseException) -> str:
+    """异常转成可读原因；超时这类不带消息的异常也要说清是什么。"""
+    text = str(error).strip()
+    if text:
+        return text
+    if isinstance(error, TimeoutError):
+        return '请求超时'
+    return type(error).__name__
+
+
+def multi_routes(config: dict) -> list[dict]:
+    """勾了「多图」且当前可用的线路，按列表顺序。至少两条才构成多图模式。"""
+    return [route for route in valid_routes(config) if route.get('multi')]
+
+
 async def optimize_prompt(config: dict, text: str) -> str:
     """用中央对话模型把用户描述改写为生图提示词；失败时回落到原文。"""
     value = str(text or '').strip()
@@ -366,7 +386,11 @@ async def _direct_chat_image(config: dict, prompt: str, route: dict) -> dict:
         'messages': [{'role': 'user', 'content': prompt}],
         'modalities': ['image', 'text'],
     }
-    timeout = aiohttp.ClientTimeout(total=min(300, max(30, target['timeout'])))
+    # 线路设了超时就用它（最长 600 秒）；没设则跟随中央模块的全局超时
+    limit = int(route.get('timeout') or 0)
+    timeout = aiohttp.ClientTimeout(
+        total=limit if limit > 0 else min(300, max(30, target['timeout'])),
+    )
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(
@@ -387,7 +411,7 @@ async def _direct_chat_image(config: dict, prompt: str, route: dict) -> dict:
     except RuntimeError:
         raise
     except Exception as error:  # noqa: BLE001 - 网络异常也要脱敏后再上抛
-        raise RuntimeError('直连请求失败：' + _scrub(error, secret)[:300]) from None
+        raise RuntimeError('直连请求失败：' + _scrub(describe(error), secret)[:300]) from None
     try:
         message = json.loads(raw)['choices'][0]['message']
     except (ValueError, KeyError, IndexError, TypeError):
@@ -485,7 +509,7 @@ async def _direct_images_endpoint(config: dict, prompt: str, route: dict, timeou
     except RuntimeError:
         raise
     except Exception as error:  # noqa: BLE001 - 网络异常也要脱敏后再上抛
-        raise RuntimeError('直连生图失败：' + _scrub(error, secret)[:300]) from None
+        raise RuntimeError('直连生图失败：' + _scrub(describe(error), secret)[:300]) from None
     try:
         item = json.loads(raw)['data'][0]
     except (ValueError, KeyError, IndexError, TypeError):
@@ -557,25 +581,35 @@ async def generate(config: dict, prompt: str, *, exclude=()) -> dict:
         )
     errors = []
     for route in routes:
-        label = f"{provider_name(route['provider_id'])}/{route['model']}"
-        chat_mode = route.get('mode') == 'chat'
         try:
-            if chat_mode:
-                return await _chat_via(config, prompt, route)
-            return await _images_via(config, prompt, route)
+            return await generate_on(config, prompt, route)
         except Exception as error:  # noqa: BLE001 - 逐条线路汇总，最后统一上抛
-            if chat_mode or not _IMAGES_ENDPOINT_REJECTED.search(str(error)):
-                errors.append(f'{label}: {error}')
-                continue
-            # 中转明说这个模型不在生图端点上（Gemini 这类多模态模型），自动改走对话端点。
-            log.info('%s 不在生图端点上，自动改走对话端点重试', label)
-            try:
-                return await _chat_via(config, prompt, route)
-            except Exception as retry_error:  # noqa: BLE001 - 两次都失败就一起报出来
-                errors.append(
-                    f'{label}: 生图端点不支持该模型，自动改走对话端点后仍失败：{retry_error}'
-                )
+            errors.append(f'{route_label(route)}: {describe(error)}')
     raise RuntimeError('；'.join(errors)[:1200])
+
+
+async def generate_on(config: dict, prompt: str, route: dict) -> dict:
+    """只在指定的这一条线路上出图，失败直接上抛；多图模式每条线路各跑各的。
+
+    线路按自己的 `mode` 走生图端点或对话端点；生图端点明说不收这个模型时自动改走对话端点。
+    """
+    if get_service() is None:
+        raise RuntimeError(status()['message'])
+    if route.get('mode') == 'chat':
+        return await _chat_via(config, prompt, route)
+    try:
+        return await _images_via(config, prompt, route)
+    except Exception as error:  # noqa: BLE001 - 只有「端点不收这个模型」才值得换端点
+        if not _IMAGES_ENDPOINT_REJECTED.search(str(error)):
+            raise
+    # 中转明说这个模型不在生图端点上（Gemini 这类多模态模型），自动改走对话端点。
+    log.info('%s 不在生图端点上，自动改走对话端点重试', route_label(route))
+    try:
+        return await _chat_via(config, prompt, route)
+    except Exception as retry_error:  # noqa: BLE001 - 两次都失败就一起报出来
+        raise RuntimeError(
+            f'生图端点不支持该模型，自动改走对话端点后仍失败：{describe(retry_error)}'
+        ) from retry_error
 
 
 async def _images_via(config: dict, prompt: str, route: dict) -> dict:
@@ -609,7 +643,16 @@ async def _images_via(config: dict, prompt: str, route: dict) -> dict:
 
 
 async def _chat_via(config: dict, prompt: str, route: dict) -> dict:
-    """对话端点出图：开了直连调试就自己发请求，否则借中央模块的 complete()。"""
+    """对话端点出图：开了直连调试就自己发请求，否则借中央模块的 complete()。
+
+    线路设了超时同样生效：直连时最长 600 秒；借中央模块时只能比它的全局超时更短。
+    """
     if config.get('debug_direct_request'):
         return await _direct_chat_image(config, prompt, route)
-    return await _chat_image(config, prompt, route)
+    timeout = int(route.get('timeout') or 0)
+    if timeout <= 0:
+        return await _chat_image(config, prompt, route)
+    try:
+        return await asyncio.wait_for(_chat_image(config, prompt, route), timeout=timeout)
+    except asyncio.TimeoutError:
+        raise RuntimeError(f'对话端点出图超时：本条线路限定 {timeout} 秒') from None
