@@ -791,6 +791,7 @@ LGTBot 自己的 `data/`（`config.yaml`、`lgtbot.db`、`user_cache.db`）**不
 LGTBot游戏问答/
 ├── main.py              入口: meta + handler + 生命周期 + bot 绑定冲突检测
 ├── panel.html           Web 面板
+├── tests/               用例（提交、但不同步到测试环境，见 tests/README.md）
 └── app/
     ├── config.py        配置读写 (data/config.json, 原子替换)
     ├── sandbox.py       ⭐ 只读沙箱 —— 所有文件访问的唯一出入口
@@ -805,3 +806,5 @@ LGTBot游戏问答/
 ```
 
 配置与数据在 `data/`（已 gitignore）：`config.json`、`qa.db`。
+
+改完代码先跑一遍 `python tests/run_all.py`（约 10 秒，不依赖测试环境）。
