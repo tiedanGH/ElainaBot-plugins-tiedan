@@ -78,7 +78,12 @@ class Batch:
         self._finished: asyncio.Queue = asyncio.Queue()
         self._abandon_reason = ''
 
-    def add(self, routes: list[dict]) -> Shot:
+    def add(self, routes: list[dict], *, route_timeouts: bool = True) -> Shot:
+        """加一路出图。多图线路传 route_timeouts=False：线路自己的超时只给重试模式用，
+        多图里各线路不提前掐断，只受 290 秒总时限约束。
+        """
+        if not route_timeouts:
+            routes = [dict(route, timeout=0) for route in routes]
         shot = Shot(routes)
         self.shots.append(shot)
         self._tasks.append(asyncio.create_task(self._run(shot)))

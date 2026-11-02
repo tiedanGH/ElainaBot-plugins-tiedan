@@ -17,7 +17,7 @@ __plugin_meta__ = {
     'name': 'AI 画图',
     'author': '铁蛋',
     'description': '所有人可用的「画图 XXX」指令，调用中央 AI LLM 生图，并提供配置与历史记录面板',
-    'version': '1.7.0',
+    'version': '1.7.1',
     'license': 'MIT',
 }
 
@@ -26,15 +26,14 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, 'data')
 PAGE_KEY = 'ai-draw'
 _capability_task: asyncio.Task | None = None
+# 只做群聊与 QQ 私聊。频道（含频道私信）的事件干脆不注册：handler 带 block=True，
+# 注册了即使直接 return 也会把频道里的「画图」从别的插件手里吞掉。
 MESSAGE_EVENTS = [
     'GROUP_AT_MESSAGE_CREATE',
     'GROUP_MESSAGE_CREATE',
     'C2C_MESSAGE_CREATE',
-    'DIRECT_MESSAGE_CREATE',
-    'AT_MESSAGE_CREATE',
-    'MESSAGE_CREATE',
 ]
-# QQ 被动回复：每条用户消息群聊（频道同算）最多回 5 次，私聊 4 次
+# QQ 被动回复：每条用户消息群聊最多回 5 次，私聊 4 次
 _REPLY_QUOTA_GROUP = 5
 _REPLY_QUOTA_DIRECT = 4
 _NO_REPLY_LEFT = '这条消息的被动回复次数已用完（群聊 5 次、私聊 4 次），图没能发出'
@@ -109,20 +108,20 @@ def _is_owner(event) -> bool:
 
 
 def _scene_enabled(event, current: dict) -> bool:
+    if getattr(event, 'is_channel', False):
+        return False  # 频道不提供；频道私信既算私聊也算频道，按频道处理
     if getattr(event, 'is_group', False):
         return bool(current['group_enabled'])
     if getattr(event, 'is_direct', False):
         return bool(current['direct_enabled'])
-    if getattr(event, 'is_channel', False):
-        return bool(current['channel_enabled'])
     return False
 
 
 def _mention(event, current: dict) -> str:
-    """群聊与频道里生成 @发起人；私聊没有提及语义，返回空串。"""
+    """群聊里生成 @发起人；私聊没有提及语义，返回空串。"""
     if not current.get('mention_user'):
         return ''
-    if getattr(event, 'is_group', False) or getattr(event, 'is_channel', False):
+    if getattr(event, 'is_group', False):
         return f'<@{event.user_id}>'
     return ''
 
@@ -180,8 +179,8 @@ def _markdown_text(event, current: dict, caption: str, url: str, size: tuple[int
     return f'{head}\n{image}' if head else image
 
 
-def _markdown_many(event, current: dict, prompt: str, shots: list, note: str = '') -> str:
-    """多张图拼成一条 Markdown：@发起人开头，图与图之间空一行，末尾可附进度说明。"""
+def _markdown_many(event, current: dict, prompt: str, shots: list) -> str:
+    """多张图拼成一条 Markdown：@发起人开头，图与图之间空一行。"""
     blocks = []
     for shot in shots:
         width, height = media.dimensions(shot.image, (1024, 1024))
@@ -190,8 +189,7 @@ def _markdown_many(event, current: dict, prompt: str, shots: list, note: str = '
         blocks.append(f'{caption}\n{image}' if caption else image)
     body = '\n\n'.join(blocks)
     mention = _mention(event, current)
-    text = f'{mention}\n{body}' if mention else body
-    return f'{text}\n\n{note}' if note else text
+    return f'{mention}\n{body}' if mention else body
 
 
 def _delivered(response) -> bool:
@@ -388,8 +386,9 @@ class _MultiDraw:
     """一次多图请求：勾了「多图」的线路同时开画。
 
     时间都从开始审核算起：全部画完或到「多图汇总等待」就把画好的拼成一条发出去，没画完的
-    接着画；290 秒内画好的补发，过点的放弃。被动回复只剩一次时不再逐张补发，攒到最后一起发。
-    多图线路全部失败时，再按顺序试一遍没勾「多图」的线路兜底。
+    接着画、不另发提示；290 秒内画好的补发，过点的放弃。被动回复只剩一次时不再逐张补发，
+    攒到最后一起发。多图线路不受线路自己的超时约束；全部失败时，再按顺序试一遍没勾「多图」
+    的线路兜底（那是重试，照常用各自的超时）。
     """
 
     def __init__(self, event, current: dict, prompt: str, record: dict, started: float,
@@ -443,7 +442,7 @@ class _MultiDraw:
                  len(routes), '、'.join(central.route_label(route) for route in routes),
                  self.current['multi_wait_seconds'])
         for route in routes:
-            self.batch.add([route])
+            self.batch.add([route], route_timeouts=False)
         gathered = False
         while True:
             shot = await self.batch.next(self.deadline if gathered else self.gather_at)
@@ -462,14 +461,7 @@ class _MultiDraw:
             log.info('多图汇总 已画好 %s 张 还在画 %s 张 用时=%.1fs',
                      len(self.held), pending, time.monotonic() - self.started)
             if self.held:
-                await self._flush(pending)
-            elif pending and self.replies.left >= 2:
-                # 一张都还没好也先回一句，不让用户干等；至少给补发留一次回复
-                self.replies.take()
-                await _reply_text(
-                    self.event, _fill(self.current['multi_progress_text'], pending=pending),
-                    self.current,
-                )
+                await self._flush()
             if not pending:
                 break
         dropped = await self.batch.abandon()
@@ -508,10 +500,9 @@ class _MultiDraw:
         hosted = any(shot.hosted_url for shot in self.held)
         return int(hosted) + sum(1 for shot in self.held if not shot.hosted_url)
 
-    async def _flush(self, pending: int = 0) -> None:
+    async def _flush(self) -> None:
         """把攒着的图发出去：有图床直链的拼成一条 Markdown，其余逐张富媒体。"""
         shots, self.held = self.held, []
-        note = _fill(self.current['multi_progress_text'], pending=pending) if pending else ''
         hosted = [shot for shot in shots if shot.hosted_url]
         loose = [shot for shot in shots if not shot.hosted_url]
         if hosted and not self.replies.take():
@@ -519,7 +510,7 @@ class _MultiDraw:
                 shot.error = _NO_REPLY_LEFT
         elif hosted:
             response = await self._send(self.event.reply(
-                _markdown_many(self.event, self.current, self.prompt, hosted, note),
+                _markdown_many(self.event, self.current, self.prompt, hosted),
                 msg_type=2,
                 skip_suffix=True,
                 force_verify_image_resource=bool(self.current['force_verify_image']),
@@ -530,11 +521,9 @@ class _MultiDraw:
                 shot.delivered = ok
                 if not ok:
                     shot.error = 'Markdown 图片消息发送失败，请确认图床域名已在 QQ 开放平台报备'
-            if ok:
-                note = ''
-            elif self.current['media_fallback']:
+            if not ok and self.current['media_fallback']:
                 loose = hosted + loose
-        for index, shot in enumerate(loose):
+        for shot in loose:
             if not self.replies.take():
                 shot.error = _NO_REPLY_LEFT
                 continue
@@ -542,8 +531,6 @@ class _MultiDraw:
                 self.event, self.current,
                 _caption(self.current, self.event, self.prompt, shot.result or {}),
             )
-            if note and index == len(loose) - 1:
-                content = f'{content}\n{note}'.strip()
             response = await self._send(self.event.reply_image(
                 shot.image or (shot.result or {}).get('url', ''), content,
             ))

@@ -35,15 +35,15 @@ DEFAULT_CONFIG = {
     'enabled': True,
     'group_enabled': True,
     'direct_enabled': True,
-    'channel_enabled': True,
     # 生图线路
     'image_routes': [],
     'image_size': '1024x1024',
     'delivery_max_attempts': 2,
-    # 多图模式：勾了「多图」的线路同时开画，到这个时长（从开始审核算）先把画好的发出去，
-    # 没画完的继续画，在 290 秒内画好就补发。
-    'multi_wait_seconds': 90,
-    'multi_progress_text': '还有 {pending} 张在画，画好会自动补发',
+    # 多图模式：总开关默认关。开着且至少两条线路勾了「多图」时，这几条同时开画，到汇总等待
+    # （从开始审核算）先把画好的发出去，没画完的接着画、不另发提示，290 秒内画好就补发；
+    # 不足两条就按原来的顺序重试。线路自己的超时只给重试模式用。
+    'multi_enabled': False,
+    'multi_wait_seconds': 180,
     # ⚠ 调试开关：允许插件绕过中央模块直接向接口发对话请求（需要读取中央模块的密钥）。
     # 默认关闭；关闭时插件在任何代码路径上都不会去取密钥。
     'debug_direct_request': False,
@@ -103,13 +103,23 @@ def init(data_dir: str) -> dict:
     os.makedirs(data_dir, exist_ok=True)
     _path = os.path.join(data_dir, 'config.json')
     with _lock:
-        _cache = validate(_merge(DEFAULT_CONFIG, _read()))
+        _cache = validate(_merge(DEFAULT_CONFIG, _upgrade(_read())))
         _write(_cache)
         return copy.deepcopy(_cache)
 
 
 def initialized() -> bool:
     return _cache is not None
+
+
+def _upgrade(saved: dict) -> dict:
+    """旧版配置迁移：多图汇总等待 1.7.0 默认 90 秒，1.7.1 起默认 180 秒，没改过的跟着新默认走。
+
+    只有 1.7.0 写过 multi_progress_text（1.7.1 已删），拿它认出 1.7.0 的配置文件。
+    """
+    if 'multi_progress_text' in saved and saved.get('multi_wait_seconds') == 90:
+        saved['multi_wait_seconds'] = 180
+    return saved
 
 
 def _merge(defaults: dict, current: dict) -> dict:
@@ -182,11 +192,8 @@ def _text_list(value, label: str, limit: int, *, fold: bool = False) -> list[str
     ))[:limit]
 
 
-def validate(value: dict) -> dict:
-    value['image_size'] = str(value.get('image_size') or '1024x1024')
-    if value['image_size'] not in IMAGE_SIZES:
-        value['image_size'] = '1024x1024'
-    routes = value.get('image_routes', [])
+def normalize_routes(routes) -> list[dict]:
+    """生图线路去重、补默认值。"""
     if not isinstance(routes, list):
         raise ValueError('生图线路必须是接口与模型列表')
     normalized = []
@@ -201,7 +208,8 @@ def validate(value: dict) -> dict:
             continue
         # mode=chat 走 /v1/chat/completions（Gemini 这类多模态模型不在生图端点上）
         mode = str(item.get('mode') or 'image').strip().casefold()
-        # 0 = 跟随中央模块的全局超时；否则 10~600 秒，按线路单独设定
+        # 0 = 跟随中央模块的全局超时；否则 10~600 秒，按线路单独设定。只在重试模式生效，
+        # 多图模式里勾了「多图」的线路不提前掐断
         timeout = _int_in(item.get('timeout'), 0, 0, 600)
         normalized.append({
             'provider_id': provider_id,
@@ -213,12 +221,22 @@ def validate(value: dict) -> dict:
             'enabled': bool(item.get('enabled', True)),
         })
         seen.add(key)
-    value['image_routes'] = normalized
+    return normalized
+
+
+def count_multi(routes) -> int:
+    """启用中且勾了「多图」的线路数；多图模式至少要两条才能打开。"""
+    return sum(1 for route in normalize_routes(routes) if route['multi'] and route['enabled'])
+
+
+def validate(value: dict) -> dict:
+    value['image_size'] = str(value.get('image_size') or '1024x1024')
+    if value['image_size'] not in IMAGE_SIZES:
+        value['image_size'] = '1024x1024'
+    value['image_routes'] = normalize_routes(value.get('image_routes', []))
     value['delivery_max_attempts'] = _int_in(value.get('delivery_max_attempts'), 2, 1, 5)
     # 汇总必须早于 290 秒的硬截止，否则没有补发窗口可言
-    value['multi_wait_seconds'] = _int_in(value.get('multi_wait_seconds'), 90, 10, 280)
-    progress = _text(value.get('multi_progress_text'), DEFAULT_CONFIG['multi_progress_text'], 200)
-    value['multi_progress_text'] = progress if '{pending}' in progress else progress + '（{pending} 张）'
+    value['multi_wait_seconds'] = _int_in(value.get('multi_wait_seconds'), 180, 10, 280)
 
     value['prompt_provider_id'] = str(value.get('prompt_provider_id') or '').strip()[:128]
     value['prompt_model'] = str(value.get('prompt_model') or '').strip()[:256]
@@ -265,7 +283,7 @@ def validate(value: dict) -> dict:
     value['history_limit'] = _int_in(value.get('history_limit'), 500, 20, 20000)
     value['history_image_limit'] = _int_in(value.get('history_image_limit'), 200, 0, 5000)
     for key in (
-        'enabled', 'group_enabled', 'direct_enabled', 'channel_enabled',
+        'enabled', 'group_enabled', 'direct_enabled', 'multi_enabled',
         'debug_direct_request', 'capability_enabled',
         'prompt_optimize_enabled', 'notice_enabled', 'mention_user',
         'markdown_send', 'force_verify_image', 'media_fallback',

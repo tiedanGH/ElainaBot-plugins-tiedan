@@ -183,7 +183,12 @@ def describe(error: BaseException) -> str:
 
 
 def multi_routes(config: dict) -> list[dict]:
-    """勾了「多图」且当前可用的线路，按列表顺序。至少两条才构成多图模式。"""
+    """多图模式开着时，勾了「多图」且当前可用的线路，按列表顺序。
+
+    不足两条时调用方退回原来的顺序重试；总开关关着时一律返回空。
+    """
+    if not config.get('multi_enabled'):
+        return []
     return [route for route in valid_routes(config) if route.get('multi')]
 
 

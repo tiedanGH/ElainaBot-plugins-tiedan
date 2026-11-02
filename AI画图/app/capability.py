@@ -31,7 +31,7 @@ _DEFINITION = {
         '根据文字描述生成图片，返回本机图床的图片直链、实测像素宽高（width / height），'
         '并附一段可直接发送的 QQ Markdown 图片语法（markdown 字段）。'
         '返回的链接已转存到机器人自己的图床，可以直接发出去；不会给 AI 接口的原始链接。'
-        '默认画 1 张；传 max_images≥2 时几条线路同时各画一张，'
+        '默认画 1 张；传 max_images≥2 且 AI 画图开了多图模式时，几条线路同时各画一张，'
         '到 wait_seconds 为止画好的都放进 images 数组一起返回，没画完的只留档、不会再补给你。'
         '描述要写清主体、动作、场景、风格；不要传入已有图片链接。'
         '图片由 AI 画图插件统一做内容审核与留档，失败时返回 ok=false 与原因。'
@@ -54,7 +54,7 @@ _DEFINITION = {
                     'maximum': MAX_IMAGES,
                     'description': (
                         '最多要几张，默认 1。≥2 时启用多图：勾了「多图」的线路同时各画一张；'
-                        'AI 画图没配好两条以上多图线路时按 1 张处理'
+                        'AI 画图没开多图模式、或没配好两条以上多图线路时按 1 张处理'
                     ),
                 },
                 'wait_seconds': {
@@ -240,15 +240,19 @@ async def _run(session: _Session, arguments: dict) -> dict:
         record['duration_ms'] = round((time.monotonic() - started) * 1000)
         return _fail('调用方在出图前就已离开，没有出图', record, current)
 
-    routes = central.multi_routes(current)[:wanted if left is None else min(wanted, left)]
+    multi = central.multi_routes(current)
+    routes = multi[:wanted if left is None else min(wanted, left)]
     if wanted >= 2 and len(routes) >= 2:
         return await _multi(session, current, record, routes, started, wait, caller)
     payload = await _single(session, current, record, started, caller)
     if wanted >= 2 and payload.get('ok'):
-        payload['note'] = (
-            '今日额度只够再画 1 张' if left == 1 and len(central.multi_routes(current)) >= 2
-            else 'AI 画图没有配好两条以上可用的「多图」线路'
-        ) + '，按单张出图'
+        if not current['multi_enabled']:
+            reason = 'AI 画图没有开启多图模式'
+        elif len(multi) < 2:
+            reason = 'AI 画图没有配好两条以上可用的「多图」线路'
+        else:
+            reason = '今日额度只够再画 1 张'
+        payload['note'] = reason + '，按单张出图'
     return payload
 
 
@@ -361,7 +365,7 @@ async def _multi(session: _Session, current: dict, base: dict, routes: list[dict
         log.info('画图能力 多图 caller=%s 同时请求 %s 条线路：%s 等待=%ss', caller or '未知',
                  len(routes), '、'.join(central.route_label(route) for route in routes), wait)
         for route in routes:
-            batch.add([route])
+            batch.add([route], route_timeouts=False)
         ready: list[fanout.Shot] = []
         failed: list[fanout.Shot] = []
         fallback = False

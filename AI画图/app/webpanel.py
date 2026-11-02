@@ -16,6 +16,7 @@ from . import capability, central, config, hosting, limiter, media, store
 log = get_logger(PLUGIN, 'AI画图')
 
 PREFIX = '/api/ext/ai-draw'
+_MULTI_NEEDS_TWO = '至少要给两条启用中的线路勾上「多图」并保存线路，才能开启多图模式'
 _INLINE_PREVIEW_BYTES = 8 * 1024 * 1024
 _registered = False
 
@@ -62,6 +63,15 @@ async def _get_config(_request: web.Request) -> web.Response:
 async def _save_config(request: web.Request) -> web.Response:
     body = await _body(request)
     try:
+        current = config.load()
+        if body.get('multi_enabled') and not current['multi_enabled']:
+            # 打开多图前得先有两条勾了「多图」的线路。已经开着时线路减到不足两条不拦，
+            # 运行时自动退回顺序重试。
+            routes = body['image_routes'] if 'image_routes' in body else current['image_routes']
+            if config.count_multi(routes) < 2:
+                return web.json_response(
+                    {'success': False, 'error': _MULTI_NEEDS_TWO}, status=400,
+                )
         value = await asyncio.to_thread(config.save, body)
         requested = str(value.get('prompt_provider_id') or '')
         resolved, model = central.resolve_selection(
