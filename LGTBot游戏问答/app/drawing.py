@@ -224,17 +224,41 @@ async def _generate(prompt: str, current: dict, key: str) -> dict:
     if item is None:
         return {'ok': False, 'error': state()['message']}
 
-    # 出图比一次模型调用慢得多（实测几十秒），必须单独设超时：任务挂住不放会一直
-    # 留在 _pending 里，后面同样的描述会一直等它。
+    # 出图比一次模型调用慢得多（实测几十秒，慢线路能到 180 秒），必须单独设超时：
+    # 任务挂住不放会一直留在 _pending 里，后面同样的描述会一直等它。
+    #
+    # ⚠️ 超时**宁可设长**：AI 画图 1.7 起会检测调用方是否还在
+    #   （capability.handle 的 shield + session.leave）。我们这边 wait_for 一旦触发，
+    #   取消会传到对方的 handle()，它把 caller_gone 置位 —— 图照画完，但**只留档、
+    #   不再把链接给我们**。那等于图已经出了、额度也扣了，我们却拿不到，
+    #   缓存也写不进去，下次重问还得重画。见 _cache_ttl 那套机制的初衷。
     timeout = float(current.get('draw_timeout_seconds') or 0)
+    arguments = {
+        'prompt': prompt,
+        'caller': CALLER,
+        # 明确只要一张。对方 1.7.0 起支持 max_images 多图并发出图，默认虽是 1，
+        # 但这边写死更稳：本插件一次问答只发一张图（上限在 main.tool_handler 里管），
+        # 真要多图得先想清楚群里连发 N 张图的观感和对方的日额度。
+        'max_images': 1,
+    }
+    # 多图模式才用得上，但按对方 schema 的要求一并传：它必须比我们自己的超时短，
+    # 否则我们先超时走人，对方那边一张也交不出来。
+    if timeout > 0:
+        wait = int(max(10, min(280, timeout - 10)))
+        arguments['wait_seconds'] = wait
     call = service.call_capability(
         consumer_plugin=central.CONSUMER,
         capability_key=str(item['key']),
-        arguments={'prompt': prompt, 'caller': CALLER},
+        arguments=arguments,
     )
     try:
         result = await (asyncio.wait_for(call, timeout) if timeout > 0 else call)
     except asyncio.TimeoutError:
+        # 这条日志要能直接指出怎么改：对方已经在画了，是我们没等够
+        log.warning(
+            f'画图等待 {timeout:.0f} 秒未返回，已放弃；对方会把图画完但只留档不回链接。'
+            f'慢线路可能要 180 秒，建议把面板的「单次画图超时」调大'
+        )
         return {'ok': False, 'error': f'画图超时（{timeout:.0f} 秒未返回）'}
     except Exception as error:  # noqa: BLE001 — 失败原因原样给模型，让它换个说法或放弃
         log.warning(f'画图能力调用失败: {type(error).__name__}: {error}')
@@ -245,20 +269,37 @@ async def _generate(prompt: str, current: dict, key: str) -> dict:
     if not result.get('ok'):
         # 对方的失败原因（命中违规词、额度用完、线路全挂）原样透给模型，
         # 它才知道该不该换个描述再试一次。
-        return {'ok': False, 'error': str(result.get('error') or '画图失败')[:300]}
-    url = str(result.get('url') or '')
+        reason = str(result.get('error') or '画图失败')[:300]
+        if '调用方已离开' in reason:
+            # 只可能是我们自己超时走人导致的（见上面 wait_for 的说明）。
+            # 对方那句话是写给它自己日志看的，直接透给模型只会让它莫名其妙。
+            log.warning('对方报告「调用方已离开」—— 本次画图是被我们自己的超时掐断的')
+            reason = '画图没能在超时时间内完成，图已生成但没能取回，请管理员调大画图超时。'
+        return {'ok': False, 'error': reason}
+    # 1.7.0 起统一返回体：images 永远是数组，顶层镜像第一张（兼容老调用方）。
+    # 优先读数组，不靠镜像 —— 镜像是对方为兼容留的，不该当成长期契约。
+    images = result.get('images')
+    first = images[0] if isinstance(images, list) and images and isinstance(images[0], dict) else result
+    url = str(first.get('url') or result.get('url') or '')
     if not url:
         return {'ok': False, 'error': '画图成功但没有拿到图片链接'}
+    extra = int(result.get('count') or 1) - 1
+    if extra > 0:
+        # 我们只要一张，多的不发也不缓存。真出现了说明对方忽略了 max_images，
+        # 要么是版本没跟上，要么是它那边的行为变了，得看得见。
+        log.warning(f'只要 1 张却收到 {extra + 1} 张，多余的已忽略（检查 max_images 是否生效）')
     # 实测像素宽高，留着给 Markdown 图片消息用 —— QQ 的 `![alt #宽px #高px](url)`
     # 要这两个数，写错了客户端就按错误的比例给图占位。
-    size = _dimensions(result)
+    # width / height 在 entry 里，requested_size 只在顶层，所以两边都要看。
+    size = _dimensions(first) or _dimensions(result)
     if _cache_ttl(current) > 0:
         try:
             await asyncio.to_thread(store.draw_cache_put, key, url, size)
         except Exception as error:  # noqa: BLE001 — 缓存写不进去顶多下次重画
             log.warning(f'画图结果缓存失败: {error}')
-    log.info(f'画图完成（{result.get("model") or "未知模型"}）')
-    return {'ok': True, 'url': url, 'model': str(result.get('model') or ''), 'size': size}
+    model = str(first.get('model') or result.get('model') or '')
+    log.info(f'画图完成（{model or "未知模型"}）')
+    return {'ok': True, 'url': url, 'model': model, 'size': size}
 
 
 async def _cached(key: str, current: dict) -> dict:
