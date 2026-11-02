@@ -8,14 +8,15 @@
 本插件面向普通群友开放，工具面必须逐个点名，不能让模型顺手拿到别的插件注册的
 写操作或联网能力。
 
-需要外部能力时走白名单：画图就是这么接的 —— 只把 ``ai_draw:tool:draw`` 一个能力
-包装成自己的工具（见 drawing.py），其余共享能力仍然一个都进不来。
+需要外部能力时走白名单：画图就是这么接的 —— 只把 AI 画图经框架钩子提供的
+``draw_image`` 一个包装成自己的工具（见 drawing.py），其余能力仍然一个都进不来。
 
 同理传 ``prepare_context=False``：历史由 store.py 自己裁剪，不需要中央再压一遍。
 """
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 
 from core.base.logger import PLUGIN, get_logger
@@ -76,6 +77,35 @@ def tool_time_budget(current: dict) -> float:
         max(0.0, float(current.get('draw_timeout_seconds') or 0))
         * max(1, int(current.get('draw_max_per_question') or 1))
     )
+
+
+def tool_timeout(current: dict) -> float:
+    """单个工具最多执行多久。
+
+    中央 AI LLM 1.3 起按工具单独限时（``tool_timeout``，默认 120 秒），到点**终止整次
+    complete()**，而且报的是「执行超时」—— ``is_transient`` 认它是瞬时故障，``_bounded``
+    会把整轮问答（含所有检索）重跑一遍。检索工具都是本地 IO，120 秒绰绰有余；画图不行。
+
+    所以画图开着时放宽到「画图等待 + 30 秒」：让 drawing 自己的超时先到，给模型一句
+    能看懂的失败原因，而不是被中央掐断整轮。画图等待设成 0（不限）时给到 600。
+    """
+    base = 120.0
+    if not current.get('draw_enabled'):
+        return base
+    wait = float(current.get('draw_timeout_seconds') or 0)
+    return max(base, wait + 30) if wait > 0 else 600.0
+
+
+def _accepts(function, name: str) -> bool:
+    """中央模块的 complete() 收不收某个参数。
+
+    中央是市场模块、各环境版本不一：``tool_timeout`` 1.3 才有，老版本不认、传了直接
+    TypeError，那样每个问题都会答不出来。
+    """
+    try:
+        return name in inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 async def _bounded(make_coro, current: dict, label: str, extra_timeout: float = 0.0):
@@ -467,6 +497,9 @@ async def ask(
     provider_id, model = resolve_selection(
         str(current.get('provider_id') or ''), str(current.get('model_preference') or ''),
     )
+    options = {}
+    if _accepts(service.complete, 'tool_timeout'):
+        options['tool_timeout'] = tool_timeout(current)
     return await _bounded(lambda: service.complete(
         messages=messages,
         system_prompt=system_prompt,
@@ -480,4 +513,5 @@ async def ask(
         session_id=session_id,
         consumer_plugin=CONSUMER,
         prepare_context=False,
+        **options,
     ), current, '模型调用', tool_time_budget(current))

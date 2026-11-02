@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import importlib.util
+import inspect
 import os
 import sys
 import tempfile
@@ -59,6 +61,47 @@ _stub('core.plugin.web_pages', register_page=_NOOP, unregister_page=_NOOP,
       register_route=lambda *a, **k: (lambda fn: fn))
 APP = types.SimpleNamespace(module_manager=None)
 _stub('core.application', get_app=lambda: APP)
+
+
+class FakeHooks:
+    """框架 HookManager（core/module/hook.py）的最小替身，语义照真实实现：
+
+    任意字符串当钩子名；pipeline 让数据按 priority 依次流过回调，回调返回 None 即拦截；
+    回调抛异常只记日志、**数据原样往下传** —— 所以对方炸了时调用方拿回的是自己传进去的 dict。
+    """
+
+    def __init__(self):
+        self._hooks: dict = {}
+
+    def register(self, name, callback, *, owner='unknown', priority=100):
+        self._hooks.setdefault(name, []).append((priority, owner, callback))
+
+    def unregister_owner(self, owner):
+        for name in list(self._hooks):
+            self._hooks[name] = [entry for entry in self._hooks[name] if entry[1] != owner]
+            if not self._hooks[name]:
+                del self._hooks[name]
+
+    def has(self, name):
+        return bool(self._hooks.get(name))
+
+    async def pipeline(self, name, data):
+        if data is None:
+            return None
+        for _priority, _owner, callback in sorted(self._hooks.get(name, []), key=lambda e: e[0]):
+            try:
+                value = callback(data)
+                data = await value if inspect.isawaitable(value) else value
+            except Exception:  # noqa: BLE001 — 与真实实现一致：吞掉异常，数据原样往下传
+                continue
+            if data is None:
+                return None
+        return data
+
+
+HOOKS = FakeHooks()
+_stub('core.module')
+_stub('core.module.hook', get_hook_manager=lambda: HOOKS)
 
 # ==================== 载入插件 ====================
 
@@ -147,62 +190,67 @@ def patched(target, **attrs):
             setattr(target, name, value)
 
 
-# ==================== 中央模块与画图能力的假实现 ====================
+# ==================== AI 画图（对外画图工具）的假实现 ====================
 
-class FakeService:
-    """假的中央 AI LLM 服务，只实现画图能力相关的三个接口。
+DRAW_TOOL = {'type': 'function', 'function': {
+    'name': 'draw_image', 'description': 'd',
+    'parameters': {'type': 'object', 'properties': {'prompt': {'type': 'string'}},
+                   'required': ['prompt'], 'additionalProperties': False}}}
 
-    ``result`` 是 call_capability 的返回值；默认按 AI画图 1.7 的返回体造。
+
+class FakeDrawPlugin:
+    """假的「AI 画图」：像 1.8.0 那样把 draw_image 挂到框架钩子上（见 use_draw）。
+
+    ``result`` 是 ai_draw.call 回给调用方的 result，默认按 AI画图 1.7+ 的返回体造；
+    ``boom`` 让回调抛异常（真实钩子会吞掉、原样返回传入的 dict），``swallow`` 让回调
+    不给 result；``calls`` 记着每次收到的外层 dict。
     """
 
-    def __init__(self, *, result=None, shared=True, online=True, enabled=True, present=True,
-                 delay=0.0, boom=None):
+    OWNER = 'AI画图'
+
+    def __init__(self, *, result=None, tools=None, delay=0.0, boom=None, swallow=False):
         self.result = result if result is not None else draw_payload([draw_entry('https://bed/1.png')])
-        self.shared, self.online, self.enabled, self.present = shared, online, enabled, present
-        self.delay, self.boom = delay, boom
+        self.tools = tools if tools is not None else [DRAW_TOOL]
+        self.delay, self.boom, self.swallow = delay, boom, swallow
         self.calls: list = []
+        self.cancelled = False
 
-    def _item(self) -> dict:
-        return {'key': 'ai_draw:tool:draw', 'id': 'draw', 'kind': 'tool',
-                'source_plugin': 'ai_draw', 'name': 'AI 画图', 'description': 'd',
-                'enabled': self.enabled, 'shared': self.shared, 'online': self.online}
+    async def on_tools(self, data):
+        return {**data, 'plugin': 'AI画图', 'interface': 2, 'call_hook': 'ai_draw.call',
+                'tools': copy.deepcopy(self.tools)}
 
-    def plugin_capabilities(self, *, consumer_plugin='', kind='', public=False):
-        return [self._item()] if self.present else []
-
-    def list_capabilities(self, consumer_plugin, kind=''):
-        if not (self.present and self.online and self.enabled and self.shared):
-            return []
-        return [self._item()]
-
-    async def call_capability(self, consumer_plugin, capability_key, arguments=None):
-        self.calls.append({'consumer': consumer_plugin, 'key': capability_key,
-                           'arguments': dict(arguments or {})})
+    async def on_call(self, data):
+        self.calls.append(copy.deepcopy(data))
         if self.delay:
-            await asyncio.sleep(self.delay)
+            try:
+                await asyncio.sleep(self.delay)
+            except asyncio.CancelledError:
+                self.cancelled = True   # 调用方的超时顺着钩子传过来了
+                raise
         if self.boom:
             raise self.boom
-        return self.result
+        if self.swallow:
+            return data
+        return {**data, 'result': copy.deepcopy(self.result)}
 
 
-def use_service(service) -> None:
-    """把假服务挂到框架桩上；传 None 等于中央模块不存在。"""
-    if service is None:
-        APP.module_manager = None
-        return
-    APP.module_manager = types.SimpleNamespace(
-        get=lambda name: service if name == 'ai_llm' else None, list_modules=lambda: [])
+def use_draw(plugin) -> None:
+    """把假的 AI 画图挂到钩子上；传 None 等于 AI 画图没装、没加载或没开对外工具。"""
+    HOOKS.unregister_owner(FakeDrawPlugin.OWNER)
+    if plugin is not None:
+        HOOKS.register('ai_draw.tools', plugin.on_tools, owner=FakeDrawPlugin.OWNER)
+        HOOKS.register('ai_draw.call', plugin.on_call, owner=FakeDrawPlugin.OWNER)
 
 
 def draw_entry(url: str, width: int = 768, height: int = 1344) -> dict:
-    """AI画图 1.7 返回体里的一张图（capability._entry）。"""
+    """AI画图 1.7+ 返回体里的一张图（capability._entry）。"""
     return {'url': url, 'model': 'sd', 'provider': 'p', 'record_id': 1,
             'width': width, 'height': height,
             'markdown': f'![AI画图 #{width}px #{height}px]({url})'}
 
 
 def draw_payload(entries: list, mode: str = 'single', **extra) -> dict:
-    """AI画图 1.7 的统一返回体：images 数组 + 顶层镜像第一张（capability._payload）。"""
+    """AI画图 1.7+ 的统一返回体：images 数组 + 顶层镜像第一张（capability._payload）。"""
     return {'ok': True, 'mode': mode, 'count': len(entries), 'pending': 0,
             'images': entries, **entries[0], 'requested_size': '1024x1024', **extra}
 

@@ -25,12 +25,12 @@ python tests/test_drawing.py       # 单独跑一个
 
 | 文件 | 管什么 |
 |---|---|
-| `_harness.py` | 框架打桩、载入插件、`check` / `finish`、假的中央服务与消息事件 |
+| `_harness.py` | 框架打桩（含照真实语义实现的钩子 `core.module.hook`）、载入插件、`check` / `finish`、假的 AI 画图与消息事件 |
 | `run_all.py` | 每个文件一个子进程跑（插件有模块级状态，同进程连跑会串味），汇总结果 |
 | `test_tools_schema.py` | 画图开关决定交给模型几个工具；执行入口也挡 |
 | `test_prompt.py` | 项目简介口径（智力竞技、维护者）、游戏数量现算、硬规则块都在 |
-| `test_timeouts.py` | 画图时间计入调用超时、默认 180 秒、瞬时 / 永久故障分类 |
-| `test_drawing.py` | 能力发现、AI画图 1.7 接口、尺寸解析、诊断、被打断后的复用 |
+| `test_timeouts.py` | 画图时间计入调用超时、默认 180 秒、中央 1.3 单工具超时（新版放宽、老版不传）、瞬时 / 永久故障分类 |
+| `test_drawing.py` | 经框架钩子检索与调用 AI画图、单图契约放外层、1.7+ 返回体、尺寸解析、诊断、被打断后的复用 |
 | `test_delivery.py` | Markdown 图片消息格式与兜底、一整轮问答里的张数上限与发送顺序 |
 | `test_grounding.py` | 接地闸、画游戏内容前必须先读源码、泄漏工具调用的解析 |
 | `test_moderation.py` | 入口 / 出口拦截话术分开、必填文案清空恢复默认 |

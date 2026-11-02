@@ -38,7 +38,7 @@ __plugin_meta__ = {
     'name': 'LGTBot 游戏问答',
     'author': '铁蛋',
     'description': '@机器人提问 LGTBot 游戏规则与结算，AI 现场检索源码后作答',
-    'version': '1.10.4',
+    'version': '1.10.5',
     'license': 'MIT',
 }
 
@@ -1231,7 +1231,7 @@ async def initialize() -> None:
     if not ready:
         log.warning('LGTBot 源码目录不可用: %s —— 请在面板配置', sandbox.base_dir(current))
     if current.get('draw_enabled'):
-        # 插件加载顺序不保证，AI 画图可能还没注册能力，所以这条只作提示，
+        # 插件加载顺序不保证，AI 画图可能还没把钩子挂上，所以这条只作提示，
         # 以面板上的实时状态为准。
         state = drawing.state()
         log.info('画图能力：%s%s', state['message'],

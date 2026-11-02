@@ -1,7 +1,7 @@
 """接地闸、先检索后画图、泄漏工具调用的解析与代为执行。"""
 from _harness import (
-    FakeService, answer_with, check, finish, fresh_env, games, main, patched, section,
-    use_service,
+    FakeDrawPlugin, answer_with, check, finish, fresh_env, games, main, patched, section,
+    use_draw,
 )
 
 base = fresh_env(draw_enabled=True, moderation_enabled=False, cooldown_seconds=0, daily_limit=0)
@@ -47,8 +47,8 @@ async def draw_first(current, messages, system_prompt, tool_handler, session_id)
     return {'text': '我先去读一下规则。'}
 
 
-svc = FakeService()
-use_service(svc)
+svc = FakeDrawPlugin()
+use_draw(svc)
 event = answer_with('画一张换位象棋的棋盘', draw_first, index=GAMES)
 check('画图调用被拒并要求先检索', got and got[0]['ok'] is False and 'read_game_source' in got[0]['error'],
       got)

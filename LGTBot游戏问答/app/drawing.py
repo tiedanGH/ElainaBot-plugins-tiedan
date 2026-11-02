@@ -1,13 +1,13 @@
 """画图能力适配层。
 
-「AI 画图」插件把自己的出图能力注册成了中央 AI LLM 的共享工具
-（`ai_draw:tool:draw`，见 AI画图/app/capability.py），任何插件都能通过
-``service.call_capability()`` 调用它。本模块把那个能力包装成本插件模型可见的
-第七个工具 ``draw_image``。
+「AI 画图」插件（≥1.8.0）把出图做成了它自己的对外工具，挂在框架的全局钩子上
+（见 AI画图/app/capability.py）：``ai_draw.tools`` 检索、``ai_draw.call`` 调用，
+不经过中央 AI LLM —— 中央 1.3 起去掉了跨插件共享工具。本模块把它包装成本插件
+模型可见的第七个工具 ``draw_image``。
 
-**能力键不自己拼**：按中央模块文档的要求，从 ``list_capabilities()`` 的返回值里
-取 ``key``。自己拼字符串的话，对方改了 id 或 source 就会静默失效，而且绕过了
-「这个能力当前是否授权给我」的判断。
+**工具名不凭空调用**：每次先从 ``ai_draw.tools`` 的检索结果里确认对方确实提供
+``draw_image``，再按这个名字去调。对方改了名、版本没跟上时能直接说清楚，而不是
+静默拿到一个空结果。
 
 分工：出图、内容审核、留档、每日额度全部发生在 AI 画图那边，本插件只负责
 「要不要给模型这个工具」「一次问答最多画几张」，以及把图片发给用户。
@@ -20,7 +20,7 @@ import re
 
 from core.base.logger import PLUGIN, get_logger
 
-from . import central, store
+from . import store
 
 log = get_logger(PLUGIN, 'LGTBot游戏问答')
 
@@ -28,8 +28,8 @@ log = get_logger(PLUGIN, 'LGTBot游戏问答')
 #
 # 这两层（内存任务 + 落盘缓存）是给「请求被打断」准备的。中央模块的单次调用超时
 # 覆盖**整个** complete()，工具执行时间也算在内；画图动辄几十秒，一旦撞线，
-# asyncio.wait_for 会取消整条调用链，中央那边记成 error='interrupted'
-# （modules/ai_llm/app/service.py:1893），而我们这边会退避重试。
+# asyncio.wait_for 会取消整条调用链，中央那边记成 error='interrupted'，
+# 而我们这边会退避重试。
 #
 # 问题在于：图那时候往往**已经在画甚至画完了**。重试再画一张，等于同一个请求
 # 烧两次额度，用户还是什么都没收到。所以画图跑在独立任务里、用 shield 挡住取消：
@@ -76,10 +76,11 @@ def _dimensions(result: dict) -> str:
     match = _SIZE_RE.match(str(result.get('requested_size') or result.get('size') or ''))
     return f'{int(match.group(1))}x{int(match.group(2))}' if match else ''
 
-SOURCE = 'ai_draw'          # AI画图 注册时用的 source_plugin
-CAPABILITY_ID = 'draw'      # 它的能力 id
-TOOL_NAME = 'draw_image'    # 暴露给模型的工具名（与对方内部 id 区分开）
-CALLER = 'LGTBot游戏问答'   # 传给对方留档用的调用方标注
+TOOLS_HOOK = 'ai_draw.tools'  # AI画图 的检索钩子：返回它对外的工具定义
+CALL_HOOK = 'ai_draw.call'    # AI画图 的调用钩子：按工具名执行，结果在 result 里
+REMOTE_TOOL = 'draw_image'    # AI画图 对外工具的名字（每次以检索结果为准）
+TOOL_NAME = 'draw_image'      # 暴露给本插件模型的工具名
+CALLER = 'LGTBot游戏问答'     # 传给对方留档用的调用方标注
 
 # 画面描述的长度上限。AI 画图那边自己也有 input_max_length，这里先截一道，
 # 避免模型把整段源码当描述丢过去。
@@ -121,70 +122,52 @@ def enabled(current: dict) -> bool:
     return bool(current.get('draw_enabled'))
 
 
-def _all_draw_tools(service) -> dict | None:
-    """不带消费者过滤地找这个能力，用于把「没装」和「没授权」区分开。"""
+def _hooks():
+    """框架的全局 HookManager；取不到时返回 None（等同于 AI 画图不可用）。"""
     try:
-        items = service.plugin_capabilities(kind='tool', public=True)
-    except Exception:  # noqa: BLE001 — 面板诊断用，取不到就按未安装处理
+        from core.module.hook import get_hook_manager
+
+        return get_hook_manager()
+    except Exception:  # noqa: BLE001 — 取不到就按画图不可用处理
         return None
-    return next((
-        item for item in items
-        if item.get('source_plugin') == SOURCE and item.get('id') == CAPABILITY_ID
-    ), None)
 
 
-def _authorized(service) -> dict | None:
-    """取**本插件当前真的能调**的那条能力记录（含在线判断）。"""
-    try:
-        items = service.list_capabilities(central.CONSUMER, 'tool')
-    except Exception:  # noqa: BLE001 — 发现失败等同于不可用
-        return None
-    return next((
-        item for item in items
-        if item.get('source_plugin') == SOURCE and item.get('id') == CAPABILITY_ID
-    ), None)
+_MISSING = (
+    '未检测到「AI 画图」的对外画图工具：请确认 AI画图（≥1.8.0）已加载，'
+    '且它面板里的「公开画图工具」开着'
+)
 
 
 def state() -> dict:
-    """面板诊断：到底是没装、没启用、没共享，还是没在线。
+    """面板诊断：AI 画图有没有把对外画图工具挂出来。
 
-    这几种情况在模型侧的表现完全一样（工具调用失败），但管理员要做的事完全不同，
-    所以必须分开说清楚，而不是笼统回一句「画图不可用」。
+    挂没挂一眼就能看出来；没挂的几种原因（没装、没加载、对方开关关着）对管理员来说
+    都是去 AI 画图那边看一眼，所以合成一句说清楚就够了。
     """
-    service = central.get_service()
-    if service is None:
-        return {'installed': False, 'usable': False, 'message': '中央 AI LLM 模块不可用'}
-    if not hasattr(service, 'list_capabilities'):
-        return {
-            'installed': False, 'usable': False,
-            'message': '当前 AI LLM 模块版本不支持插件能力共享，请升级模块',
-        }
-    known = _all_draw_tools(service)
-    if known is None:
-        return {
-            'installed': False, 'usable': False,
-            'message': '未检测到「AI 画图」注册的画图能力，请确认已安装并启用 AI画图（≥1.5.0）',
-        }
-    name = str(known.get('name') or '画图')
-    if not known.get('online'):
-        return {
-            'installed': True, 'usable': False,
-            'message': f'{name}能力当前不在线：AI 画图插件未加载，或它自己的「对外开放」开关是关的',
-        }
-    if not known.get('enabled'):
-        return {
-            'installed': True, 'usable': False,
-            'message': f'{name}能力在 AI LLM 面板里被停用了',
-        }
-    if _authorized(service) is None:
-        return {
-            'installed': True, 'usable': False,
-            'message': (
-                f'{name}能力未授权给本插件：请在 AI LLM 面板把它设为「共享给所有插件」，'
-                f'或把 {central.CONSUMER} 加进它的 allowed_consumers'
-            ),
-        }
-    return {'installed': True, 'usable': True, 'message': f'{name}能力已就绪，可供模型调用'}
+    hooks = _hooks()
+    if hooks is None:
+        return {'installed': False, 'usable': False, 'message': '框架钩子不可用，检索不到 AI 画图'}
+    if not hooks.has(CALL_HOOK):
+        return {'installed': False, 'usable': False, 'message': _MISSING}
+    return {
+        'installed': True, 'usable': True,
+        'message': 'AI 画图的对外画图工具已就绪',
+    }
+
+
+async def _discover(hooks) -> str:
+    """检索 AI 画图的对外工具，确认 draw_image 在里面。返回空串表示可用，否则是原因。"""
+    found = await hooks.pipeline(TOOLS_HOOK, {})
+    tools = found.get('tools') if isinstance(found, dict) else None
+    names = {
+        str((item.get('function') or {}).get('name') or '')
+        for item in tools or [] if isinstance(item, dict)
+    }
+    if REMOTE_TOOL in names:
+        return ''
+    if not tools:
+        return _MISSING
+    return f'AI 画图没有提供 {REMOTE_TOOL} 工具（只有 {"、".join(sorted(names))}），可能是版本不匹配'
 
 
 def detach_image(result: dict) -> dict:
@@ -217,42 +200,39 @@ async def _generate(prompt: str, current: dict, key: str) -> dict:
     **这个协程跑在独立任务里**（见 run 的 shield）：调用方被超时取消也不影响它跑完。
     图已经在画了，丢掉纯属浪费额度 —— 跑完把结果写进缓存，下次直接拿。
     """
-    service = central.get_service()
-    if service is None or not hasattr(service, 'call_capability'):
-        return {'ok': False, 'error': '中央 AI LLM 模块不可用'}
-    item = _authorized(service)
-    if item is None:
+    hooks = _hooks()
+    if hooks is None or not hooks.has(CALL_HOOK):
         return {'ok': False, 'error': state()['message']}
+    problem = await _discover(hooks)
+    if problem:
+        return {'ok': False, 'error': problem}
 
     # 出图比一次模型调用慢得多（实测几十秒，慢线路能到 180 秒），必须单独设超时：
     # 任务挂住不放会一直留在 _pending 里，后面同样的描述会一直等它。
     #
     # ⚠️ 超时**宁可设长**：AI 画图 1.7 起会检测调用方是否还在
-    #   （capability.handle 的 shield + session.leave）。我们这边 wait_for 一旦触发，
-    #   取消会传到对方的 handle()，它把 caller_gone 置位 —— 图照画完，但**只留档、
+    #   （capability.draw 的 shield + session.leave）。我们这边 wait_for 一旦触发，
+    #   取消会顺着钩子传到对方的 draw()，它把 caller_gone 置位 —— 图照画完，但**只留档、
     #   不再把链接给我们**。那等于图已经出了、额度也扣了，我们却拿不到，
     #   缓存也写不进去，下次重问还得重画。见 _cache_ttl 那套机制的初衷。
     timeout = float(current.get('draw_timeout_seconds') or 0)
-    arguments = {
-        'prompt': prompt,
+    envelope = {
+        'name': REMOTE_TOOL,
+        # 模型能决定的只有描述；其余放外层，是我们自己定的、模型改不了
+        'arguments': {'prompt': prompt},
         'caller': CALLER,
-        # 明确只要一张。对方 1.7.0 起支持 max_images 多图并发出图，默认虽是 1，
-        # 但这边写死更稳：本插件一次问答只发一张图（上限在 main.tool_handler 里管），
-        # 真要多图得先想清楚群里连发 N 张图的观感和对方的日额度。
+        # 明确只要一张（外层的 max_images 是上限）。对方 1.7.0 起支持多图并发出图，
+        # 默认虽是 1，但这边写死更稳：本插件一次问答只发一张图（上限在 main.tool_handler
+        # 里管），真要多图得先想清楚群里连发 N 张图的观感和对方的日额度。
         'max_images': 1,
     }
-    # 多图模式才用得上，但按对方 schema 的要求一并传：它必须比我们自己的超时短，
+    # 多图模式才用得上，但一并传：它必须比我们自己的超时短，
     # 否则我们先超时走人，对方那边一张也交不出来。
     if timeout > 0:
-        wait = int(max(10, min(280, timeout - 10)))
-        arguments['wait_seconds'] = wait
-    call = service.call_capability(
-        consumer_plugin=central.CONSUMER,
-        capability_key=str(item['key']),
-        arguments=arguments,
-    )
+        envelope['wait_seconds'] = int(max(10, min(280, timeout - 10)))
+    call = hooks.pipeline(CALL_HOOK, envelope)
     try:
-        result = await (asyncio.wait_for(call, timeout) if timeout > 0 else call)
+        reply = await (asyncio.wait_for(call, timeout) if timeout > 0 else call)
     except asyncio.TimeoutError:
         # 这条日志要能直接指出怎么改：对方已经在画了，是我们没等够
         log.warning(
@@ -264,6 +244,11 @@ async def _generate(prompt: str, current: dict, key: str) -> dict:
         log.warning(f'画图能力调用失败: {type(error).__name__}: {error}')
         return {'ok': False, 'error': f'画图失败: {error}'[:300]}
 
+    # 钩子在等待期间被摘掉（对方重载）、或对方回调出错时，pipeline 会原样返回我们传进去的
+    # dict —— 里面没有 result。这时不能当成功处理。
+    result = reply.get('result') if isinstance(reply, dict) else None
+    if result is None:
+        return {'ok': False, 'error': 'AI 画图没有返回结果（可能正在重载），请稍后再试'}
     if not isinstance(result, dict):
         return {'ok': False, 'error': '画图能力返回了无法识别的结果'}
     if not result.get('ok'):

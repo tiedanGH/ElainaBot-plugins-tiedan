@@ -2,8 +2,8 @@
 import os
 
 from _harness import (
-    FakeEvent, FakeService, PLUGIN_DIR, answer_with, check, finish, fresh_env, main, run,
-    section, store, use_service,
+    FakeDrawPlugin, FakeEvent, PLUGIN_DIR, answer_with, check, finish, fresh_env, main, run,
+    section, store, use_draw,
 )
 
 fresh_env(draw_enabled=True, draw_max_per_question=1, moderation_enabled=False,
@@ -56,8 +56,8 @@ def asker(prompts):
     return fake_ask, got
 
 
-svc = FakeService()
-use_service(svc)
+svc = FakeDrawPlugin()
+use_draw(svc)
 reused_before = store.stats()['draws_reused_total']
 drawn_before = store.stats()['draws_total']
 fake_ask, got = asker(['橘色的猫'])
@@ -77,8 +77,8 @@ check('复用计 3 次', store.stats()['draws_reused_total'] == reused_before + 
       store.stats()['draws_reused_total'])
 
 section('一整轮问答：换着描述就撞张数上限')
-svc = FakeService()
-use_service(svc)
+svc = FakeDrawPlugin()
+use_draw(svc)
 fake_ask, got = asker(['小狗A', '小狗B', '小狗C', '小狗D'])
 event = answer_with('多画几张', fake_ask, index={})
 check('超出上限的被拒', sum(1 for r in got if not r['ok'] and '已经画过' in r['error']) == ROUNDS - 1,

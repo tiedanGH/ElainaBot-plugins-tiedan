@@ -1,5 +1,5 @@
 """超时与重试：画图时间要算进模型调用超时，瞬时/永久故障分类要准。"""
-from _harness import central, check, config, finish, fresh_env, section
+from _harness import central, check, config, finish, fresh_env, patched, run, section
 
 base = fresh_env()
 
@@ -19,6 +19,71 @@ check('默认 180 秒，对齐 AI画图 的线路上限', default == 180, defaul
 total = config.DEFAULT_CONFIG['request_timeout_seconds'] + central.tool_time_budget(
     dict(base, draw_enabled=True))
 check('默认配置下整轮仍在 QQ 被动消息 5 分钟窗口内', total <= 300, total)
+
+section('中央 1.3 的单工具超时：画图开着要放宽')
+# 中央 1.3 起每个工具单独限时（默认 120 秒），到点终止整次 complete()，报的「执行超时」
+# 又会被 is_transient 当成瞬时故障，整轮问答连同所有检索重跑一遍。
+check('画图关着沿用中央默认 120 秒', central.tool_timeout(off) == 120.0, central.tool_timeout(off))
+wait180 = dict(base, draw_enabled=True, draw_timeout_seconds=180)
+check('开着比画图等待多留 30 秒（让自己的画图超时先到）',
+      central.tool_timeout(wait180) == 210.0, central.tool_timeout(wait180))
+check('画图等待不限时（0）给到 600', central.tool_timeout(dict(wait180, draw_timeout_seconds=0)) == 600.0)
+check('等待很短时也不低于中央默认',
+      central.tool_timeout(dict(wait180, draw_timeout_seconds=30)) == 120.0)
+check('始终比画图等待长', all(
+    central.tool_timeout(dict(wait180, draw_timeout_seconds=s)) > s for s in (10, 90, 180, 300, 600)))
+check('中央的「执行超时」确实会被当成瞬时故障（所以必须放宽）',
+      central.is_transient('工具 draw_image 执行超时') is True)
+
+
+class NewCentral:
+    """1.3 起的 complete()：有 tool_timeout。"""
+
+    def __init__(self):
+        self.kwargs = {}
+
+    async def complete(self, messages, *, tool_timeout: float = 120, **kwargs):
+        self.kwargs = dict(kwargs, tool_timeout=tool_timeout)
+        return {'text': 'ok'}
+
+
+class OldCentral:
+    """1.3 以前的 complete()：没有 tool_timeout，也不收 **kwargs。"""
+
+    def __init__(self):
+        self.called = False
+
+    async def complete(self, messages, *, system_prompt='', provider_id='', model='',
+                       temperature=None, max_tokens=None, tools=None, tool_handler=None,
+                       max_tool_rounds=None, session_id='', consumer_plugin='',
+                       prepare_context=True):
+        self.called = True
+        return {'text': 'ok'}
+
+
+async def _noop_tool(name, arguments):
+    return {}
+
+
+def _ask_with(service):
+    with patched(central, get_service=lambda: service,
+                 resolve_selection=lambda provider_id='', model='': ('', '')):
+        return run(central.ask(wait180, [{'role': 'user', 'content': 'q'}], 'sys', _noop_tool, 's'))
+
+
+new = NewCentral()
+_ask_with(new)
+check('新版中央收到放宽后的 tool_timeout', new.kwargs.get('tool_timeout') == 210.0, new.kwargs)
+old = OldCentral()
+try:
+    run(old.complete([], tool_timeout=1))
+    strict = False
+except TypeError:
+    strict = True
+check('（前提）老版签名传 tool_timeout 会 TypeError', strict)
+old.called = False
+answer = _ask_with(old)
+check('老版中央不传 tool_timeout，照常能答', old.called and answer == {'text': 'ok'}, answer)
 
 section('瞬时 / 永久故障分类')
 for text, expect in [
